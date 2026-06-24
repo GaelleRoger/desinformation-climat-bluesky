@@ -304,6 +304,13 @@ if __name__ == "__main__":
 > **🎓 Concept — Job vs Service**
 > Un Cloud Run **service** répond à des requêtes en continu (et coûte tant qu'il tourne). Un Cloud Run **job** s'exécute une fois, fait son travail, et s'arrête. Pour de l'ingestion planifiée, le **job** est parfait : zéro coût au repos. C'est ce qui remplace l'« interrupteur » manuel de la v1.
 
+> **🎓 Concept — Deux façons de packager : buildpacks vs Dockerfile**
+> Cloud Run Jobs accepte deux modes de déploiement :
+> - **Buildpacks** (mode simple) : tu fournis juste `requirements.txt` + `main.py`, et `gcloud run jobs deploy --source` demande à Cloud Build de construire le conteneur **pour toi**, automatiquement. Zéro Dockerfile à écrire. Idéal pour démarrer ou pour un job trivial.
+> - **Dockerfile** (mode contrôlé) : tu écris explicitement le conteneur. Plus de travail initial, mais tu maîtrises tout (version de Python, paquets système, optimisation de l'image, reproductibilité totale).
+>
+> **Choix pour ce tutoriel : Dockerfile**, pour deux raisons. (1) *Pédagogique* — un architecte doit savoir lire et écrire un Dockerfile ; le voir explicitement aide à comprendre ce qui tourne. (2) *Prévoyance* — le jour où tu auras besoin d'un paquet système (lib C, outil CLI) ou de figer un point de version précis, le Dockerfile est obligatoire ; autant l'avoir dès le départ. Le piège junior est de ne connaître qu'une des deux options : en entretien, sache dire « j'ai choisi le Dockerfile pour la maîtrise, mais les buildpacks suffisaient ».
+
 `ingestion/posts/Dockerfile` :
 ```dockerfile
 FROM python:3.11-slim
@@ -316,7 +323,7 @@ CMD ["python", "main.py"]
 `requirements.txt` : `requests`, `google-cloud-secret-manager`, `google-cloud-storage`.
 
 ```bash
-# Déployer le job (build automatique de l'image depuis la source)
+# Déployer le job (Cloud Build détecte le Dockerfile et l'utilise)
 gcloud run jobs deploy ingest-posts \
   --source ./ingestion/posts \
   --region $REGION \
@@ -328,6 +335,8 @@ gcloud run jobs deploy ingest-posts \
 # Test manuel
 gcloud run jobs execute ingest-posts --region $REGION
 ```
+
+> **🤔 Pour aller plus loin :** la commande `--source` est ambivalente — elle marche dans les deux modes. Si Cloud Build trouve un `Dockerfile` à la racine du dossier, il l'utilise ; sinon il bascule sur les buildpacks. Le même `gcloud` peut donc déployer un job avec ou sans Dockerfile, ce qui est pratique pour migrer plus tard.
 
 ### 2.6 Planifier le micro-batch (Cloud Scheduler)
 
@@ -345,7 +354,10 @@ gcloud scheduler jobs create http ingest-posts-schedule \
 
 ### 2.7 Ingestion météo (job quotidien)
 
-Même principe, plus simple. `ingestion/weather/main.py` appelle OpenWeatherMap (clé via Secret Manager) pour Paris et écrit un fichier dans `gs://${PROJECT_ID}-bronze-weather/dt=YYYY-MM-DD/weather.json`.
+Même structure de conteneur qu'en 2.5 (Dockerfile minimal + `requirements.txt` + `main.py`), juste un contenu Python différent. `ingestion/weather/main.py` appelle OpenWeatherMap (clé via Secret Manager) pour Paris et écrit un fichier dans `gs://${PROJECT_ID}-bronze-weather/dt=YYYY-MM-DD/weather.json`.
+
+> **🎓 Concept — La cohérence opérationnelle est un asset architectural**
+> On aurait pu se dire « le job météo est trivial, les buildpacks suffisent, pas la peine de Dockerfile ». C'est tentant — mais c'est un piège. **Avoir tous les jobs structurés pareil** (même layout `Dockerfile + requirements.txt + main.py`, même façon d'être déployés) coûte un peu plus à l'écriture initiale et rapporte énormément à la maintenance et au CI/CD. Quand le pipeline Cloud Build de l'étape 5 doit builder N jobs, une **règle unique** suffit s'ils ont tous la même structure. Mélanger buildpacks et Dockerfile pour des jobs de même nature complique le CI/CD sans bénéfice. L'**uniformité disciplinée** est une qualité d'architecte — un projet ne se juge pas seulement à ce qui tourne, mais à la facilité avec laquelle un nouveau venu peut le lire.
 
 ```python
 def run():
@@ -359,6 +371,7 @@ def run():
 ```
 
 ```bash
+# Déploiement : exactement le même pattern qu'en 2.5
 gcloud run jobs deploy ingest-weather --source ./ingestion/weather \
   --region $REGION --service-account $SA \
   --set-env-vars PROJECT_ID=$PROJECT_ID
