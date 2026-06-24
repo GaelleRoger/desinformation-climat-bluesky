@@ -506,17 +506,76 @@ Note la **colonne `dt` synthétisée automatiquement** par BigQuery à partir du
 
 ### 3.2 Initialiser Dataform
 
-Console GCP : **BigQuery > Dataform > Créer un dépôt**, connecté à un dépôt Git (GitHub) — essentiel pour le portfolio.
-
-```
-definitions/
-  sources/     # déclarations des tables externes bronze
-  staging/     # silver
-  marts/       # gold
-```
-
 > **🎓 Concept — Dataform = SQL + dépendances + tests**
 > Dataform ajoute au SQL trois superpouvoirs : un **graphe de dépendances** (il exécute dans le bon ordre), des **tests qualité** (assertions), et le **versioning Git**. C'est ce qui transforme un tas de scripts en pipeline industrialisé. dbt fait la même chose — savoir le dire en entretien est un plus.
+
+#### Comprendre la hiérarchie Dataform
+
+Avant de cliquer, il faut distinguer trois niveaux qu'on confond souvent :
+
+| Niveau | Nom | Qui le choisit ? |
+|---|---|---|
+| **Dépôt Dataform** (repository) | `climat-meteo` (ou ce que tu veux) | **Toi**, dans la console GCP |
+| **Espace de travail** (workspace) | `default` par défaut, pointe sur la branche Git | Dataform crée `default` automatiquement ; tu peux en créer d'autres pour des branches de test |
+| **Dossier `definitions/`** | `definitions` | **Imposé par Dataform** — c'est là que vivent les fichiers `.sqlx`, point |
+
+Les **sous-dossiers** à l'intérieur de `definitions/` (comme `sources/`, `staging/`, `marts/`) sont en revanche **libres** — tu les crées toi-même pour organiser tes modèles par couche médaillon.
+
+#### Arborescence complète du projet
+
+Voici à quoi ressemble l'arbre côté GitHub (`https://github.com/GaelleRoger/desinformation-climat-bluesky/`), avec le sous-dossier `dataform/` que Dataform synchronisera :
+
+```
+desinformation-climat-bluesky/         ← dépôt GitHub (tu l'as déjà créé)
+├── ingestion/
+│   ├── posts/                         ← job Cloud Run ingestion Bluesky
+│   │   ├── Dockerfile
+│   │   ├── requirements.txt
+│   │   └── main.py
+│   └── weather/                       ← job Cloud Run météo
+│       ├── Dockerfile
+│       ├── requirements.txt
+│       └── main.py
+├── classification/                    ← prepare / load_results Vertex
+├── orchestration/
+│   └── pipeline.yaml                  ← Cloud Workflows
+├── dataform/                          ← contenu synchronisé par Dataform
+│   ├── workflow_settings.yaml         ← config du projet Dataform
+│   └── definitions/                   ← NOM IMPOSÉ par Dataform
+│       ├── sources/                   ← sous-dossiers d'organisation libre
+│       │   ├── posts_ext.sqlx
+│       │   └── weather_ext.sqlx
+│       ├── staging/                   ← silver
+│       │   ├── posts_clean.sqlx
+│       │   └── weather_daily.sqlx
+│       └── marts/                     ← gold
+│           ├── daily_disinfo.sqlx
+│           └── climate_x_weather.sqlx
+├── terraform/                         ← infra déclarative
+├── cloudbuild.yaml                    ← CI/CD
+└── README.md
+```
+
+> **🎓 Concept — Pourquoi `dataform/` comme sous-dossier du dépôt GitHub ?**
+> Dataform sait se brancher sur **un sous-dossier** d'un dépôt Git (paramètre « root directory » à la création). Conséquence pratique : ton dépôt GitHub peut contenir TOUT le projet (jobs Python, Terraform, Cloud Build…), et Dataform ne synchronise que ce qui le concerne (`dataform/`). Sans ce mécanisme, il faudrait un dépôt GitHub dédié juste à Dataform — fragmentation inutile.
+
+#### Créer le dépôt Dataform
+
+Console GCP : **BigQuery > Dataform > Créer un dépôt**.
+
+| Champ | Valeur recommandée |
+|---|---|
+| ID du dépôt | `climat-meteo` |
+| Région | la même que ton projet (ex. `europe-west9`) |
+| Compte de service | celui de ton pipeline (`ingestion-sa@…`) ou un compte dédié Dataform |
+| Connexion Git | URL : `https://github.com/GaelleRoger/desinformation-climat-bluesky.git` |
+| Branche par défaut | `main` |
+| **Sous-dossier (root directory)** | `dataform` |
+| Jeton d'authentification | secret Secret Manager contenant un *Personal Access Token* GitHub avec scope `repo` |
+
+> **🤔 Pour aller plus loin — l'authentification Git :** Dataform a besoin d'un token GitHub pour cloner et pousser. On stocke ce token dans **Secret Manager** (même réflexe que pour les clés Bluesky/OWM, cf. 2.1) et on donne au compte de service Dataform le rôle `secretmanager.secretAccessor` sur ce secret. Le projet entier respecte ainsi un seul principe : *aucun secret en clair nulle part*.
+
+Une fois le dépôt créé, Dataform crée automatiquement un workspace `default` pointant sur `main`. Tu pourras alors ouvrir ce workspace dans la console et créer (ou voir, s'ils sont déjà dans `dataform/definitions/` sur GitHub) tes fichiers `.sqlx`.
 
 ### 3.3 Couche silver — posts nettoyés et dédupliqués
 
@@ -1048,8 +1107,8 @@ options:
 Connexion à Git : un *trigger* Cloud Build qui écoute les push sur `main`.
 ```bash
 gcloud builds triggers create github \
-  --repo-name=climat-meteo-pipeline \
-  --repo-owner=TON_USER \
+  --repo-name=desinformation-climat-bluesky \
+  --repo-owner=GaelleRoger \
   --branch-pattern="^main$" \
   --build-config=cloudbuild.yaml
 ```
@@ -1085,7 +1144,7 @@ Connexion : Looker Studio → Créer → Source de données → BigQuery → `go
 ### 6.2 La documentation finale du dépôt
 
 ```
-climat-meteo-pipeline/
+desinformation-climat-bluesky/
 ├── README.md              # vitrine : schéma, choix, captures du dashboard
 ├── ARCHITECTURE.md        # le doc d'architecture
 ├── ingestion/
@@ -1093,7 +1152,8 @@ climat-meteo-pipeline/
 │   └── weather/           # job météo quotidien
 ├── classification/        # prepare / batch / load_results (Gemini)
 ├── orchestration/         # pipeline.yaml (Cloud Workflows)
-├── dataform/
+├── dataform/              # contenu synchronisé par Dataform (root dir = dataform)
+│   ├── workflow_settings.yaml
 │   └── definitions/       # sources, staging (silver), marts (gold)
 ├── terraform/             # infra déclarative (storage, iam, orchestration, observability)
 ├── cloudbuild.yaml        # pipeline CI/CD
