@@ -304,6 +304,13 @@ if __name__ == "__main__":
 > **🎓 Concept — Job vs Service**
 > Un Cloud Run **service** répond à des requêtes en continu (et coûte tant qu'il tourne). Un Cloud Run **job** s'exécute une fois, fait son travail, et s'arrête. Pour de l'ingestion planifiée, le **job** est parfait : zéro coût au repos. C'est ce qui remplace l'« interrupteur » manuel de la v1.
 
+> **🎓 Concept — Deux façons de packager : buildpacks vs Dockerfile**
+> Cloud Run Jobs accepte deux modes de déploiement :
+> - **Buildpacks** (mode simple) : tu fournis juste `requirements.txt` + `main.py`, et `gcloud run jobs deploy --source` demande à Cloud Build de construire le conteneur **pour toi**, automatiquement. Zéro Dockerfile à écrire. Idéal pour démarrer ou pour un job trivial.
+> - **Dockerfile** (mode contrôlé) : tu écris explicitement le conteneur. Plus de travail initial, mais tu maîtrises tout (version de Python, paquets système, optimisation de l'image, reproductibilité totale).
+>
+> **Choix pour ce tutoriel : Dockerfile**, pour deux raisons. (1) *Pédagogique* — un architecte doit savoir lire et écrire un Dockerfile ; le voir explicitement aide à comprendre ce qui tourne. (2) *Prévoyance* — le jour où tu auras besoin d'un paquet système (lib C, outil CLI) ou de figer un point de version précis, le Dockerfile est obligatoire ; autant l'avoir dès le départ. Le piège junior est de ne connaître qu'une des deux options : en entretien, sache dire « j'ai choisi le Dockerfile pour la maîtrise, mais les buildpacks suffisaient ».
+
 `ingestion/posts/Dockerfile` :
 ```dockerfile
 FROM python:3.11-slim
@@ -316,7 +323,7 @@ CMD ["python", "main.py"]
 `requirements.txt` : `requests`, `google-cloud-secret-manager`, `google-cloud-storage`.
 
 ```bash
-# Déployer le job (build automatique de l'image depuis la source)
+# Déployer le job (Cloud Build détecte le Dockerfile et l'utilise)
 gcloud run jobs deploy ingest-posts \
   --source ./ingestion/posts \
   --region $REGION \
@@ -328,6 +335,8 @@ gcloud run jobs deploy ingest-posts \
 # Test manuel
 gcloud run jobs execute ingest-posts --region $REGION
 ```
+
+> **🤔 Pour aller plus loin :** la commande `--source` est ambivalente — elle marche dans les deux modes. Si Cloud Build trouve un `Dockerfile` à la racine du dossier, il l'utilise ; sinon il bascule sur les buildpacks. Le même `gcloud` peut donc déployer un job avec ou sans Dockerfile, ce qui est pratique pour migrer plus tard.
 
 ### 2.6 Planifier le micro-batch (Cloud Scheduler)
 
@@ -345,20 +354,28 @@ gcloud scheduler jobs create http ingest-posts-schedule \
 
 ### 2.7 Ingestion météo (job quotidien)
 
-Même principe, plus simple. `ingestion/weather/main.py` appelle OpenWeatherMap (clé via Secret Manager) pour Paris et écrit un fichier dans `gs://${PROJECT_ID}-bronze-weather/dt=YYYY-MM-DD/weather.json`.
+Même structure de conteneur qu'en 2.5 (Dockerfile minimal + `requirements.txt` + `main.py`), juste un contenu Python différent. `ingestion/weather/main.py` appelle OpenWeatherMap (clé via Secret Manager) pour Paris et écrit un fichier dans `gs://${PROJECT_ID}-bronze-weather/dt=YYYY-MM-DD/weather_HHMMSS.jsonl`.
+
+> **🎓 Concept — La cohérence opérationnelle est un asset architectural**
+> On aurait pu se dire « le job météo est trivial, les buildpacks suffisent, pas la peine de Dockerfile ». C'est tentant — mais c'est un piège. **Avoir tous les jobs structurés pareil** (même layout `Dockerfile + requirements.txt + main.py`, même façon d'être déployés) coûte un peu plus à l'écriture initiale et rapporte énormément à la maintenance et au CI/CD. Quand le pipeline Cloud Build de l'étape 5 doit builder N jobs, une **règle unique** suffit s'ils ont tous la même structure. Mélanger buildpacks et Dockerfile pour des jobs de même nature complique le CI/CD sans bénéfice. L'**uniformité disciplinée** est une qualité d'architecte — un projet ne se juge pas seulement à ce qui tourne, mais à la facilité avec laquelle un nouveau venu peut le lire.
+
+> **📄 Note de format : extension `.jsonl`**
+> Même si le fichier météo n'a qu'**une seule ligne** (un appel = une mesure), on l'écrit avec l'extension `.jsonl` et le content-type `application/jsonl`. Raison : la table externe BigQuery `bronze.weather_ext` (cf. 3.1) attend du JSONL pour tous les fichiers qu'elle lit. Tout uniformiser dans la bronze (posts ET météo) au même format simplifie la configuration. Concrètement, c'est juste l'extension qui change — un `json.dumps(envelope)` sans `indent=` produit déjà du JSONL valide pour une ligne unique.
 
 ```python
 def run():
     api_key = get_secret("owm-api-key")
     # Paris ; on récupère la météo courante (le plan gratuit la couvre)
     url = "https://api.openweathermap.org/data/2.5/weather"
-    params = {"q": "Paris,FR", "appid": api_key, "units": "metric", "lang": "fr"}
+    params = {"lat": 48.8566, "lon": 2.3522, "appid": api_key,
+              "units": "metric", "lang": "fr"}
     resp = requests.get(url, params=params, timeout=20)
     resp.raise_for_status()
-    write_weather_to_gcs(resp.json())   # même pattern d'écriture GCS
+    write_weather_to_gcs(resp.json())   # écrit .jsonl, content_type=application/jsonl
 ```
 
 ```bash
+# Déploiement : exactement le même pattern qu'en 2.5
 gcloud run jobs deploy ingest-weather --source ./ingestion/weather \
   --region $REGION --service-account $SA \
   --set-env-vars PROJECT_ID=$PROJECT_ID
@@ -385,31 +402,180 @@ Le brut est dans GCS. On le rend interrogeable par BigQuery, puis on modélise.
 > **🎓 Concept — Table externe : requêter sans copier**
 > Une table externe est une « vue » BigQuery sur des fichiers GCS. BigQuery lit les fichiers à la volée au moment de la requête, sans dupliquer les données. Avantage : pas de coût de stockage BigQuery, le brut reste dans le lake. C'est le pont entre le data lake et l'entrepôt.
 
+#### Pré-requis : tous les fichiers bronze sont en JSONL
+
+> **🎓 Concept — Un seul format de fichier dans toute la bronze**
+> BigQuery lit les tables externes selon **un seul format** par table (configuré au moment de la création). On choisit **JSONL** (`NEWLINE_DELIMITED_JSON`, une ligne = un objet JSON) pour deux raisons : (1) c'est le format standard du big data, attendu par BigQuery comme par Vertex Batch Prediction ; (2) en uniformisant **tous** les fichiers bronze à ce format (posts ET météo, même si la météo n'a qu'une ligne par fichier), on simplifie la configuration, la maintenance et le CI/CD. Comme pour le choix du Dockerfile (cf. 2.7), l'uniformité disciplinée prime sur l'optimisation unitaire.
+
+**Ajustement à apporter au job d'ingestion des posts** (cf. 2.4) : la fonction `write_to_gcs` doit écrire **une ligne par post** au lieu d'un objet enveloppe avec un tableau. Voici la version JSONL :
+
+```python
+def write_to_gcs(posts: list):
+    """Écrit un post par ligne (JSONL) — format attendu par les tables externes BigQuery."""
+    now = datetime.now(timezone.utc)
+    blob_path = f"dt={now:%Y-%m-%d}/posts_{now:%H%M%S}.jsonl"
+
+    # Une ligne par post, chacune enrichie de ses métadonnées d'ingestion
+    lines = []
+    for post in posts:
+        line = {
+            "ingested_at": now.isoformat(),
+            "search_terms": SEARCH_TERMS,
+            **post,
+        }
+        lines.append(json.dumps(line, ensure_ascii=False))
+    content = "\n".join(lines)
+
+    storage.Client().bucket(BUCKET).blob(blob_path).upload_from_string(
+        content, content_type="application/jsonl"
+    )
+    print(f"Écrit gs://{BUCKET}/{blob_path} ({len(posts)} posts)")
+```
+
+> **🎓 Concept — Le brut ne signifie pas « réponse de l'API telle quelle »**
+> On est en bronze, donc on garde les champs Bluesky intacts (`**post`). Mais on ajoute les *métadonnées d'ingestion* (`ingested_at`, `search_terms`) à chaque ligne — elles sont précieuses en silver pour la traçabilité et la déduplication. Bronze ne veut pas dire « ne touche à rien » ; ça veut dire « ne perd rien et ne transforme pas la sémantique ».
+
+**Côté météo** (cf. 2.7), même principe avec un changement minimal : le fichier s'écrit en `.jsonl` (extension + content_type), même s'il n'a qu'une ligne. Le `json.dumps(envelope)` sans indentation produit déjà du JSONL valide pour une ligne unique.
+
+#### Création de la table externe sur les posts
+
 ```bash
+# 1. Créer le dataset bronze (s'il n'existe pas)
 bq mk --dataset --location=$REGION ${PROJECT_ID}:bronze
 
-# Table externe sur les posts (JSON, partitionnée par dossier dt=)
+# 2. Générer la définition de la table (Hive partitioning par dossier dt=)
 bq mkdef --source_format=NEWLINE_DELIMITED_JSON \
   --hive_partitioning_mode=AUTO \
   --hive_partitioning_source_uri_prefix=gs://${PROJECT_ID}-bronze-posts/ \
   "gs://${PROJECT_ID}-bronze-posts/*" > /tmp/posts_def.json
+
+# 3. Créer effectivement la table à partir de cette définition
+bq mk --external_table_definition=/tmp/posts_def.json \
+  ${PROJECT_ID}:bronze.posts_ext
 ```
 
-> **🤔 Pour aller plus loin :** nos fichiers contiennent un objet JSON avec un tableau `posts`, pas une ligne JSON par post. Deux options : (a) écrire les fichiers en **JSONL** (une ligne par post) dès l'ingestion pour coller au format attendu par les tables externes, ou (b) lire le fichier entier et exploser le tableau en SQL. **Recommandation : produire du JSONL à l'ingestion** (un `post` par ligne) — c'est le format roi du big data et ça simplifie tout en aval. Ajuste `write_to_gcs` pour écrire ligne par ligne. *(C'est une décision d'implémentation à acter au codage de l'étape 2.)*
+> **🎓 Concept — `mkdef` produit, `mk` crée**
+> Deux commandes distinctes pour deux étapes distinctes. `mkdef` génère un fichier JSON décrivant **comment** BigQuery doit lire le bucket (format, partitionnement, schéma). `mk --external_table_definition` crée alors la table dans BigQuery en utilisant cette définition. Cette séparation permet d'inspecter et de versionner la définition avant la création.
+
+#### Création de la table externe sur la météo
+
+```bash
+bq mkdef --source_format=NEWLINE_DELIMITED_JSON \
+  --hive_partitioning_mode=AUTO \
+  --hive_partitioning_source_uri_prefix=gs://${PROJECT_ID}-bronze-weather/ \
+  "gs://${PROJECT_ID}-bronze-weather/*" > /tmp/weather_def.json
+
+bq mk --external_table_definition=/tmp/weather_def.json \
+  ${PROJECT_ID}:bronze.weather_ext
+```
+
+#### Requêter la bronze depuis BigQuery
+
+Une fois les tables créées, tu les requêtes **exactement comme n'importe quelle table BigQuery** — c'est tout l'intérêt des tables externes : la complexité de lecture des fichiers GCS est invisible en SQL.
+
+```sql
+-- Aperçu rapide du contenu
+SELECT * FROM `bronze.posts_ext` LIMIT 5;
+
+-- Volume de posts ingérés aujourd'hui
+SELECT COUNT(*) AS nb_posts
+FROM `bronze.posts_ext`
+WHERE dt = CURRENT_DATE();
+
+-- Rythme d'ingestion par jour (sanity check du job)
+SELECT dt, COUNT(*) AS nb_posts
+FROM `bronze.posts_ext`
+GROUP BY dt
+ORDER BY dt DESC;
+
+-- Météo des 7 derniers jours
+SELECT
+  dt,
+  JSON_VALUE(payload, '$.main.temp')      AS temp_c,
+  JSON_VALUE(payload, '$.weather[0].main') AS condition
+FROM `bronze.weather_ext`
+WHERE dt >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY);
+```
+
+Note la **colonne `dt` synthétisée automatiquement** par BigQuery à partir du nom de dossier (`dt=YYYY-MM-DD/`), grâce au `--hive_partitioning_mode=AUTO`. Tu n'as rien défini comme colonne dans le JSON ; c'est BigQuery qui l'expose à partir de la structure des dossiers.
+
+> **🎓 Concept — Toujours filtrer sur la partition Hive**
+> Une table externe sans filtre lit **tous les fichiers du bucket** à chaque requête, et BigQuery te facture l'intégralité des octets scannés. Avec un `WHERE dt = ...`, BigQuery ne lit que les dossiers concernés. C'est ce qui rend les tables externes économiques. Sans filtre, tu paies pour scanner ton historique entier à chaque requête. Réflexe non négociable.
+
+> **🤔 Pour aller plus loin :** que se passe-t-il si tu ajoutes un nouveau champ JSON dans un post à partir de demain ? Réponse : BigQuery le détectera automatiquement à la prochaine requête (schéma inféré dynamiquement). C'est très flexible — mais aussi un piège : un changement de schéma silencieux peut casser tes transformations silver sans alerte. Pour de la prod, on figerait souvent le schéma explicitement via `bq update --schema`. Bon à mentionner en entretien comme limite assumée du choix « schéma inféré ».
 
 ### 3.2 Initialiser Dataform
 
-Console GCP : **BigQuery > Dataform > Créer un dépôt**, connecté à un dépôt Git (GitHub) — essentiel pour le portfolio.
-
-```
-definitions/
-  sources/     # déclarations des tables externes bronze
-  staging/     # silver
-  marts/       # gold
-```
-
 > **🎓 Concept — Dataform = SQL + dépendances + tests**
 > Dataform ajoute au SQL trois superpouvoirs : un **graphe de dépendances** (il exécute dans le bon ordre), des **tests qualité** (assertions), et le **versioning Git**. C'est ce qui transforme un tas de scripts en pipeline industrialisé. dbt fait la même chose — savoir le dire en entretien est un plus.
+
+#### Comprendre la hiérarchie Dataform
+
+Avant de cliquer, il faut distinguer trois niveaux qu'on confond souvent :
+
+| Niveau | Nom | Qui le choisit ? |
+|---|---|---|
+| **Dépôt Dataform** (repository) | `climat-meteo` (ou ce que tu veux) | **Toi**, dans la console GCP |
+| **Espace de travail** (workspace) | `default` par défaut, pointe sur la branche Git | Dataform crée `default` automatiquement ; tu peux en créer d'autres pour des branches de test |
+| **Dossier `definitions/`** | `definitions` | **Imposé par Dataform** — c'est là que vivent les fichiers `.sqlx`, point |
+
+Les **sous-dossiers** à l'intérieur de `definitions/` (comme `sources/`, `staging/`, `marts/`) sont en revanche **libres** — tu les crées toi-même pour organiser tes modèles par couche médaillon.
+
+#### Arborescence complète du projet
+
+Voici à quoi ressemble l'arbre côté GitHub (`https://github.com/GaelleRoger/desinformation-climat-bluesky/`), avec le sous-dossier `dataform/` que Dataform synchronisera :
+
+```
+desinformation-climat-bluesky/         ← dépôt GitHub (tu l'as déjà créé)
+├── ingestion/
+│   ├── posts/                         ← job Cloud Run ingestion Bluesky
+│   │   ├── Dockerfile
+│   │   ├── requirements.txt
+│   │   └── main.py
+│   └── weather/                       ← job Cloud Run météo
+│       ├── Dockerfile
+│       ├── requirements.txt
+│       └── main.py
+├── classification/                    ← prepare / load_results Vertex
+├── orchestration/
+│   └── pipeline.yaml                  ← Cloud Workflows
+├── dataform/                          ← contenu synchronisé par Dataform
+│   ├── workflow_settings.yaml         ← config du projet Dataform
+│   └── definitions/                   ← NOM IMPOSÉ par Dataform
+│       ├── sources/                   ← sous-dossiers d'organisation libre
+│       │   ├── posts_ext.sqlx
+│       │   └── weather_ext.sqlx
+│       ├── staging/                   ← silver
+│       │   ├── posts_clean.sqlx
+│       │   └── weather_daily.sqlx
+│       └── marts/                     ← gold
+│           ├── daily_disinfo.sqlx
+│           └── climate_x_weather.sqlx
+├── terraform/                         ← infra déclarative
+├── cloudbuild.yaml                    ← CI/CD
+└── README.md
+```
+
+> **🎓 Concept — Pourquoi `dataform/` comme sous-dossier du dépôt GitHub ?**
+> Dataform sait se brancher sur **un sous-dossier** d'un dépôt Git (paramètre « root directory » à la création). Conséquence pratique : ton dépôt GitHub peut contenir TOUT le projet (jobs Python, Terraform, Cloud Build…), et Dataform ne synchronise que ce qui le concerne (`dataform/`). Sans ce mécanisme, il faudrait un dépôt GitHub dédié juste à Dataform — fragmentation inutile.
+
+#### Créer le dépôt Dataform
+
+Console GCP : **BigQuery > Dataform > Créer un dépôt**.
+
+| Champ | Valeur recommandée |
+|---|---|
+| ID du dépôt | `climat-meteo` |
+| Région | la même que ton projet (ex. `europe-west9`) |
+| Compte de service | celui de ton pipeline (`ingestion-sa@…`) ou un compte dédié Dataform |
+| Connexion Git | URL : `https://github.com/GaelleRoger/desinformation-climat-bluesky.git` |
+| Branche par défaut | `main` |
+| **Sous-dossier (root directory)** | `dataform` |
+| Jeton d'authentification | secret Secret Manager contenant un *Personal Access Token* GitHub avec scope `repo` |
+
+> **🤔 Pour aller plus loin — l'authentification Git :** Dataform a besoin d'un token GitHub pour cloner et pousser. On stocke ce token dans **Secret Manager** (même réflexe que pour les clés Bluesky/OWM, cf. 2.1) et on donne au compte de service Dataform le rôle `secretmanager.secretAccessor` sur ce secret. Le projet entier respecte ainsi un seul principe : *aucun secret en clair nulle part*.
+
+Une fois le dépôt créé, Dataform crée automatiquement un workspace `default` pointant sur `main`. Tu pourras alors ouvrir ce workspace dans la console et créer (ou voir, s'ils sont déjà dans `dataform/definitions/` sur GitHub) tes fichiers `.sqlx`.
 
 ### 3.3 Couche silver — posts nettoyés et dédupliqués
 
@@ -941,8 +1107,8 @@ options:
 Connexion à Git : un *trigger* Cloud Build qui écoute les push sur `main`.
 ```bash
 gcloud builds triggers create github \
-  --repo-name=climat-meteo-pipeline \
-  --repo-owner=TON_USER \
+  --repo-name=desinformation-climat-bluesky \
+  --repo-owner=GaelleRoger \
   --branch-pattern="^main$" \
   --build-config=cloudbuild.yaml
 ```
@@ -978,7 +1144,7 @@ Connexion : Looker Studio → Créer → Source de données → BigQuery → `go
 ### 6.2 La documentation finale du dépôt
 
 ```
-climat-meteo-pipeline/
+desinformation-climat-bluesky/
 ├── README.md              # vitrine : schéma, choix, captures du dashboard
 ├── ARCHITECTURE.md        # le doc d'architecture
 ├── ingestion/
@@ -986,7 +1152,8 @@ climat-meteo-pipeline/
 │   └── weather/           # job météo quotidien
 ├── classification/        # prepare / batch / load_results (Gemini)
 ├── orchestration/         # pipeline.yaml (Cloud Workflows)
-├── dataform/
+├── dataform/              # contenu synchronisé par Dataform (root dir = dataform)
+│   ├── workflow_settings.yaml
 │   └── definitions/       # sources, staging (silver), marts (gold)
 ├── terraform/             # infra déclarative (storage, iam, orchestration, observability)
 ├── cloudbuild.yaml        # pipeline CI/CD
