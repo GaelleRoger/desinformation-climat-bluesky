@@ -577,6 +577,49 @@ Console GCP : **BigQuery > Dataform > Créer un dépôt**.
 
 Une fois le dépôt créé, Dataform crée automatiquement un workspace `default` pointant sur `main`. Tu pourras alors ouvrir ce workspace dans la console et créer (ou voir, s'ils sont déjà dans `dataform/definitions/` sur GitHub) tes fichiers `.sqlx`.
 
+#### Déclarer les sources bronze (déclarations)
+
+Avant d'écrire les modèles silver, il faut indiquer à Dataform que `bronze.posts_ext` et `bronze.weather_ext` **existent** dans BigQuery, pour qu'on puisse y référer plus tard avec `${ref("posts_ext")}`.
+
+> **🎓 Concept — Déclaration vs modèle**
+> Dans Dataform, deux choses radicalement différentes vivent dans des fichiers `.sqlx` de même apparence :
+> - Un **modèle** (`type: "table"` ou `"view"`) : Dataform exécute le SQL et crée/met à jour la table.
+> - Une **déclaration** (`type: "declaration"`) : Dataform **n'exécute rien**. C'est juste une étiquette qui dit « cette table existe déjà, on peut y faire référence ». Aucune ressource n'est créée par cette ligne.
+>
+> Pour quoi faire ? Pour intégrer dans le graphe de dépendances Dataform des tables produites **en dehors** de Dataform — ici nos tables externes créées par `bq mk` à la section 3.1. Sans déclaration, `${ref("posts_ext")}` lèverait une erreur (« unknown reference ») et Dataform ne saurait pas que `posts_clean` dépend de `posts_ext`. Avec déclaration, le DAG est complet et la lineage est traçable de bout en bout.
+
+`dataform/definitions/sources/posts_ext.sqlx` :
+```sql
+config {
+  type: "declaration",
+  database: "VOTRE_PROJECT_ID",
+  schema: "bronze",
+  name: "posts_ext",
+  description: "Table externe BigQuery sur les fichiers JSONL bronze des posts Bluesky (créée par bq mk, cf. 3.1)."
+}
+```
+
+`dataform/definitions/sources/weather_ext.sqlx` :
+```sql
+config {
+  type: "declaration",
+  database: "VOTRE_PROJECT_ID",
+  schema: "bronze",
+  name: "weather_ext",
+  description: "Table externe BigQuery sur les fichiers JSONL bronze météo OpenWeatherMap (créée par bq mk, cf. 3.1)."
+}
+```
+
+Trois remarques pratiques :
+
+D'abord, `database` correspond au **projet GCP** dans la terminologie Dataform/BigQuery (`VOTRE_PROJECT_ID` ici — Dataform a hérité du vocabulaire SQL où la hiérarchie est *database → schema → table*). En production, on ne code pas en dur cette valeur : on la met dans `workflow_settings.yaml` (`defaultProject`) et Dataform l'injecte. Pour ce tutoriel, on l'écrit en clair pour rester lisible.
+
+Ensuite, le champ `description` est facultatif mais précieux : il documente la déclaration directement dans le code, et apparaît dans la console Dataform et la documentation BigQuery. Mettre une description sur chaque déclaration et chaque modèle est un signal de maturité — la traçabilité (*lineage*) passe par là.
+
+Enfin, **aucun SQL après le bloc `config`** : c'est ce qui distingue visuellement une déclaration d'un modèle. Si tu écris une requête en dessous, Dataform t'avertira (la déclaration ne l'exécutera pas de toute façon).
+
+> **🤔 Pour aller plus loin — quand Dataform sait-il que la déclaration est valide ?** À la compilation. Si tu déclares `posts_ext` mais que la table n'existe pas dans BigQuery, la **compilation** Dataform passe (la déclaration n'est qu'une étiquette), mais l'**exécution** du premier modèle qui fait `${ref("posts_ext")}` échouera avec une erreur BigQuery « table not found ». Cette séparation compilation/exécution est typique de Dataform : la première vérifie la cohérence du graphe, la seconde valide l'existence réelle des tables.
+
 ### 3.3 Couche silver — posts nettoyés et dédupliqués
 
 `definitions/staging/posts_clean.sqlx` :
