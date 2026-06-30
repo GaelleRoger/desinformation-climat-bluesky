@@ -577,6 +577,49 @@ Console GCP : **BigQuery > Dataform > Créer un dépôt**.
 
 Une fois le dépôt créé, Dataform crée automatiquement un workspace `default` pointant sur `main`. Tu pourras alors ouvrir ce workspace dans la console et créer (ou voir, s'ils sont déjà dans `dataform/definitions/` sur GitHub) tes fichiers `.sqlx`.
 
+#### Déclarer les sources bronze (déclarations)
+
+Avant d'écrire les modèles silver, il faut indiquer à Dataform que `bronze.posts_ext` et `bronze.weather_ext` **existent** dans BigQuery, pour qu'on puisse y référer plus tard avec `${ref("posts_ext")}`.
+
+> **🎓 Concept — Déclaration vs modèle**
+> Dans Dataform, deux choses radicalement différentes vivent dans des fichiers `.sqlx` de même apparence :
+> - Un **modèle** (`type: "table"` ou `"view"`) : Dataform exécute le SQL et crée/met à jour la table.
+> - Une **déclaration** (`type: "declaration"`) : Dataform **n'exécute rien**. C'est juste une étiquette qui dit « cette table existe déjà, on peut y faire référence ». Aucune ressource n'est créée par cette ligne.
+>
+> Pour quoi faire ? Pour intégrer dans le graphe de dépendances Dataform des tables produites **en dehors** de Dataform — ici nos tables externes créées par `bq mk` à la section 3.1. Sans déclaration, `${ref("posts_ext")}` lèverait une erreur (« unknown reference ») et Dataform ne saurait pas que `posts_clean` dépend de `posts_ext`. Avec déclaration, le DAG est complet et la lineage est traçable de bout en bout.
+
+`dataform/definitions/sources/posts_ext.sqlx` :
+```sql
+config {
+  type: "declaration",
+  database: "VOTRE_PROJECT_ID",
+  schema: "bronze",
+  name: "posts_ext",
+  description: "Table externe BigQuery sur les fichiers JSONL bronze des posts Bluesky (créée par bq mk, cf. 3.1)."
+}
+```
+
+`dataform/definitions/sources/weather_ext.sqlx` :
+```sql
+config {
+  type: "declaration",
+  database: "VOTRE_PROJECT_ID",
+  schema: "bronze",
+  name: "weather_ext",
+  description: "Table externe BigQuery sur les fichiers JSONL bronze météo OpenWeatherMap (créée par bq mk, cf. 3.1)."
+}
+```
+
+Trois remarques pratiques :
+
+D'abord, `database` correspond au **projet GCP** dans la terminologie Dataform/BigQuery (`VOTRE_PROJECT_ID` ici — Dataform a hérité du vocabulaire SQL où la hiérarchie est *database → schema → table*). En production, on ne code pas en dur cette valeur : on la met dans `workflow_settings.yaml` (`defaultProject`) et Dataform l'injecte. Pour ce tutoriel, on l'écrit en clair pour rester lisible.
+
+Ensuite, le champ `description` est facultatif mais précieux : il documente la déclaration directement dans le code, et apparaît dans la console Dataform et la documentation BigQuery. Mettre une description sur chaque déclaration et chaque modèle est un signal de maturité — la traçabilité (*lineage*) passe par là.
+
+Enfin, **aucun SQL après le bloc `config`** : c'est ce qui distingue visuellement une déclaration d'un modèle. Si tu écris une requête en dessous, Dataform t'avertira (la déclaration ne l'exécutera pas de toute façon).
+
+> **🤔 Pour aller plus loin — quand Dataform sait-il que la déclaration est valide ?** À la compilation. Si tu déclares `posts_ext` mais que la table n'existe pas dans BigQuery, la **compilation** Dataform passe (la déclaration n'est qu'une étiquette), mais l'**exécution** du premier modèle qui fait `${ref("posts_ext")}` échouera avec une erreur BigQuery « table not found ». Cette séparation compilation/exécution est typique de Dataform : la première vérifie la cohérence du graphe, la seconde valide l'existence réelle des tables.
+
 ### 3.3 Couche silver — posts nettoyés et dédupliqués
 
 `definitions/staging/posts_clean.sqlx` :
@@ -694,17 +737,23 @@ On a des posts propres en silver. On veut maintenant, pour chacun, savoir s'il r
 > **🎓 Concept — « Ingest fast, enrich later »**
 > Appeler Gemini à chaque post entrant serait coûteux, fragile (dépendance à la latence/quotas dans le chemin critique) et inutile (la classification n'a pas besoin d'être instantanée). On **accumule** les posts, et périodiquement on envoie un **lot** de quelques milliers à Vertex Batch Prediction. Gemini les traite en différé. Trois bénéfices : coût réduit (~-50 % de tokens en batch), découplage, robustesse. L'ingestion reste rapide ; l'enrichissement se fait tranquillement en arrière-plan.
 
-### 4.2 Préparer le fichier d'entrée JSONL
+### 4.2 Préparer le JSONL et lancer le Batch Prediction (un seul script)
 
-Vertex Batch Prediction attend un fichier **JSONL** dans GCS : une ligne = une requête au modèle. On génère ce fichier à partir des posts pas encore classés.
+Vertex Batch Prediction attend un fichier **JSONL** dans GCS : une ligne = une requête au modèle. On a deux étapes logiques — (a) **construire le fichier** à partir des posts non encore classés, (b) **lancer le job** Vertex qui va le traiter — qu'on regroupe dans un **seul script Python** parce qu'elles partagent les mêmes constantes (projet, bucket, chemin du fichier) et qu'elles sont indissociables : aucun intérêt à préparer sans lancer.
 
-`classification/prepare.py` (cœur de la logique) :
+> **🎓 Concept — REST, gcloud ou SDK : choisir le bon mode d'appel**
+> Vertex AI s'invoque par trois canaux : l'**API REST** (via `curl`, bas-niveau et toujours disponible), la **CLI `gcloud`** (qui ne couvre pas tous les services Vertex — la création de jobs Batch Prediction Gemini par exemple n'y est pas exposée), et le **SDK Python `google-cloud-aiplatform`** (idiomatique, intégré au code applicatif). Pour ce pipeline, on choisit le **SDK Python** : il s'intègre nativement au script qui construit le JSONL, l'objet `BatchPredictionJob` retourné expose un état exploitable par le polling de Cloud Workflows (4.4), et le code est portable d'un environnement à l'autre sans dépendance à `gcloud`. *Savoir arbitrer entre REST, CLI et SDK selon le contexte est typiquement une compétence d'architecte.*
+
+#### Le script complet : `classification/prepare_and_launch.py`
+
 ```python
 import os, json
-from google.cloud import bigquery, storage
+from google.cloud import bigquery, storage, aiplatform
 
 PROJECT = os.environ["PROJECT_ID"]
+REGION  = os.environ.get("REGION", "europe-west1")
 STAGING = f"{PROJECT}-vertex-staging"
+MODEL   = "publishers/google/models/gemini-2.5-flash"
 
 PROMPT_TEMPLATE = """Tu es un expert en désinformation climatique. \
 Analyse le post suivant (en français) et réponds STRICTEMENT en JSON.
@@ -720,7 +769,11 @@ Post : "{text}"
 Réponds avec ce JSON exact, sans texte autour :
 {{"is_climate_related": <true|false>, "is_climate_disinfo": <true|false>, "confidence": <nombre entre 0 et 1>}}"""
 
+# ─── Étape A : récupérer les posts à classer ──────────────────────────────
+
 def get_unclassified(limit=5000):
+    """Sélectionne les posts présents en silver mais absents de disinfo_labels.
+    Garantit l'idempotence : on ne reclasse jamais un post déjà traité."""
     bq = bigquery.Client()
     q = f"""
         SELECT p.post_id, p.text
@@ -731,8 +784,10 @@ def get_unclassified(limit=5000):
     """
     return list(bq.query(q).result())
 
+# ─── Étape B : construire le JSONL au format Gemini ───────────────────────
+
 def build_jsonl(rows) -> str:
-    """Construit le contenu JSONL au format attendu par Vertex (Gemini)."""
+    """Une ligne par post, au format attendu par Vertex Batch Prediction Gemini."""
     lines = []
     for r in rows:
         request = {
@@ -741,82 +796,302 @@ def build_jsonl(rows) -> str:
                     "role": "user",
                     "parts": [{"text": PROMPT_TEMPLATE.format(text=r.text)}]
                 }],
-                "generationConfig": {"temperature": 0, "responseMimeType": "application/json"}
+                "generationConfig": {
+                    "temperature": 0,
+                    "responseMimeType": "application/json",
+                },
             },
-            # on garde le post_id pour relier la prédiction au post
-            "post_id": r.post_id,
+            "post_id": r.post_id,  # on garde la clé pour relier la prédiction au post
         }
         lines.append(json.dumps(request, ensure_ascii=False))
     return "\n".join(lines)
+
+# ─── Étape C : uploader le JSONL dans le staging GCS ──────────────────────
+
+def upload_jsonl(content: str) -> str:
+    """Écrit le JSONL dans gs://<projet>-vertex-staging/input/batch.jsonl."""
+    blob_path = "input/batch.jsonl"
+    storage.Client().bucket(STAGING).blob(blob_path).upload_from_string(
+        content, content_type="application/jsonl"
+    )
+    uri = f"gs://{STAGING}/{blob_path}"
+    print(f"JSONL uploadé : {uri}")
+    return uri
+
+# ─── Étape D : lancer le Batch Prediction (non bloquant) ──────────────────
+
+def launch_batch_job(input_uri: str):
+    """Soumet le job à Vertex et rend la main immédiatement.
+    Le suivi du statut sera fait par Cloud Workflows (cf. 4.4)."""
+    aiplatform.init(project=PROJECT, location=REGION)
+    job = aiplatform.BatchPredictionJob.submit(
+        source_model=MODEL,
+        job_display_name="disinfo-classification",
+        gcs_source=input_uri,
+        gcs_destination_prefix=f"gs://{STAGING}/output/",
+    )
+    print(f"Job lancé : {job.resource_name}")
+    print(f"État initial : {job.state}")
+    return job
+
+# ─── Orchestration locale du script ───────────────────────────────────────
 
 def run():
     rows = get_unclassified()
     if not rows:
         print("Rien à classer.")
         return
-    content = build_jsonl(rows)
-    storage.Client().bucket(STAGING).blob("input/batch.jsonl") \
-        .upload_from_string(content, content_type="application/jsonl")
-    print(f"{len(rows)} posts préparés dans gs://{STAGING}/input/batch.jsonl")
+    print(f"{len(rows)} posts à classer.")
+    jsonl_uri = upload_jsonl(build_jsonl(rows))
+    launch_batch_job(jsonl_uri)
+
+if __name__ == "__main__":
+    run()
+```
+
+À ajouter à `classification/requirements.txt` :
+```
+google-cloud-bigquery
+google-cloud-storage
+google-cloud-aiplatform>=1.71.0
 ```
 
 > **🎓 Concept — Idempotence par « ce qui n'est pas encore classé »**
-> Le `LEFT JOIN ... WHERE d.post_id IS NULL` ne sélectionne que les posts absents de la table de labels. On peut relancer autant qu'on veut sans reclasser ni repayer. C'est l'**idempotence**, principe central des pipelines robustes — et ici, une protection directe du budget.
+> Le `LEFT JOIN ... WHERE d.post_id IS NULL` ne sélectionne que les posts absents de la table de labels. On peut relancer autant qu'on veut sans reclasser ni repayer. C'est l'**idempotence**, principe central des pipelines robustes — et ici, une protection directe du budget Vertex.
 
 > **🎓 Concept — `temperature: 0` pour une tâche de classification**
 > On met la température à 0 pour rendre la sortie la plus déterministe possible : on veut une classification stable, pas de la créativité. Et `responseMimeType: application/json` force un JSON valide, plus facile à parser. Ces réglages montrent qu'on sait *piloter* un LLM, pas juste l'appeler.
 
-### 4.3 Lancer le job de Batch Prediction
+> **🎓 Concept — `submit()` est non bloquant**
+> `BatchPredictionJob.submit()` soumet le job à Vertex et rend la main immédiatement avec un objet `job` qui contient `resource_name` et `state`. Le job tourne ensuite en arrière-plan, et sa durée est variable (de quelques minutes à plusieurs heures selon le volume). Pour attendre la fin, le SDK propose `job.wait()` (bloquant) ou un polling sur `job.state` — c'est précisément ce que fera Cloud Workflows en 4.4, plutôt que de bloquer un script Python pendant des heures.
+
+#### Test en local
+
+Avant de conteneuriser, un test local est la façon la plus rapide de vérifier que tout fonctionne :
 
 ```bash
-gcloud ai batch-prediction-jobs create \
-  --region=$REGION \
-  --display-name="disinfo-classification" \
-  --model="publishers/google/models/gemini-2.5-flash" \
-  --input-uri="gs://${PROJECT_ID}-vertex-staging/input/batch.jsonl" \
-  --input-format=jsonl \
-  --output-uri="gs://${PROJECT_ID}-vertex-staging/output/" \
-  --output-format=jsonl
+# Authentification application-default pour que le SDK utilise ton compte
+gcloud auth application-default login
+
+# Variables d'environnement
+export PROJECT_ID="climat-desinformation-bluesky"
+export REGION="europe-west1"
+
+# Lancement
+cd classification && python prepare_and_launch.py
 ```
 
-> **🤔 Pour aller plus loin :** pourquoi `gemini-flash` et pas `gemini-pro` ? Pour une tâche de classification simple sur texte court, le modèle « flash » (plus petit, moins cher, plus rapide) suffit largement. Choisir le plus petit modèle qui fait le travail est un arbitrage coût/qualité typique d'architecte. *(Vérifie le nom exact du modèle disponible dans ta région au moment du codage — les versions évoluent.)*
+Tu devrais voir successivement : le nombre de posts à classer, l'URI du JSONL uploadé, le `resource_name` du job soumis et son état initial (`JOB_STATE_PENDING` ou `JOB_STATE_RUNNING`).
 
-### 4.4 Récupérer les résultats et charger en silver
+#### Suivre le job une fois lancé
 
-Le job écrit des fichiers JSONL de sortie dans GCS. Chaque ligne contient la requête (avec notre `post_id`) et la réponse du modèle. On parse et on charge dans `silver.disinfo_labels`.
+Le script rend la main immédiatement, mais le job continue côté Vertex. Pour suivre son avancement :
 
-`classification/load_results.py` (logique) :
+```bash
+# Lister les jobs Batch Prediction récents
+gcloud ai operations list --region=$REGION
+
+# Ou via l'API directement
+curl -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+  "https://${REGION}-aiplatform.googleapis.com/v1/${JOB_RESOURCE_NAME}"
+```
+
+Tu peux aussi suivre dans la console : **Vertex AI → Batch predictions**. Quand le job passe à `JOB_STATE_SUCCEEDED`, les fichiers de sortie apparaissent dans `gs://<projet>-vertex-staging/output/`. Tu peux alors passer à la 4.3 (chargement des résultats).
+
+### 4.3 Récupérer les résultats et charger en silver
+
+Vertex a écrit les prédictions Gemini dans des fichiers JSONL sous `gs://<projet>-vertex-staging/output/...`. Il faut maintenant lire ces fichiers et insérer les classifications dans `silver.disinfo_labels`. C'est le rôle du script `load_results.py`.
+
+#### Pré-requis : créer la table `silver.disinfo_labels`
+
+Contrairement à `posts_clean` ou `weather_daily`, **cette table n'est PAS créée par Dataform** — elle est peuplée par du code Python (`load_results.py`) qui fait des `INSERT`. Elle doit donc exister *avant* la première exécution du script, sinon `insert_rows_json` plantera avec « Not found: Table ... ».
+
+```bash
+PROJECT_ID="climat-desinformation-bluesky"
+
+bq mk --table \
+  --description="Classifications Gemini : désinformation climatique OUI/NON par post" \
+  ${PROJECT_ID}:silver.disinfo_labels \
+  post_id:STRING,is_climate_disinfo:BOOLEAN,is_climate_related:BOOLEAN,confidence:FLOAT,model_version:STRING,classified_at:TIMESTAMP
+```
+
+> **🎓 Concept — `sources/` Dataform regroupe par origine, pas par couche médaillon**
+> Tu as deux notions distinctes qu'il ne faut pas confondre : la **couche médaillon** (bronze/silver/gold) classe les tables par leur niveau de transformation ; le dossier `sources/` de Dataform classe les tables par **qui les produit** (Dataform ou autre chose). Une table peut être en silver côté médaillon ET dans `dataform/definitions/sources/` côté Dataform — c'est précisément le cas de `disinfo_labels` (créée par `load_results.py`, donc hors Dataform). Pas de contradiction : ce sont deux axes orthogonaux.
+
+Ajoute donc la déclaration `dataform/definitions/sources/disinfo_labels.sqlx` pour que les modèles gold puissent y référer :
+```sql
+config {
+  type: "declaration",
+  database: "climat-desinformation-bluesky",
+  schema: "silver",
+  name: "disinfo_labels",
+  description: "Classifications désinfo produites par load_results.py (Gemini Batch Prediction). Créée hors Dataform, déclarée ici pour le graphe de dépendances."
+}
+```
+
+#### Le script complet `classification/load_results.py`
+
 ```python
-def parse_and_load():
-    bq = bigquery.Client()
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Job de chargement des résultats Vertex Batch Prediction dans BigQuery.
+
+Lit les fichiers JSONL produits par Vertex dans gs://<projet>-vertex-staging/output/,
+parse les prédictions Gemini, et insère les classifications dans silver.disinfo_labels.
+
+Idempotent : ré-exécutable sans risque (marquage .loaded des fichiers traités).
+"""
+
+import json
+import logging
+import os
+import sys
+from datetime import datetime, timezone
+
+from google.cloud import bigquery, storage
+
+PROJECT_ID = os.environ["PROJECT_ID"]
+STAGING_BUCKET = f"{PROJECT_ID}-vertex-staging"
+TABLE_ID = f"{PROJECT_ID}.silver.disinfo_labels"
+MODEL_VERSION = "gemini-2.5-flash"
+PROCESSED_SUFFIX = ".loaded"   # marqueur d'idempotence
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(message)s",
+                    stream=sys.stdout)
+logger = logging.getLogger(__name__)
+
+
+def list_output_files() -> list:
+    """Liste les fichiers JSONL de prédiction non encore chargés."""
     client = storage.Client()
-    rows = []
-    for blob in client.bucket(STAGING).list_blobs(prefix="output/"):
+    blobs = client.list_blobs(STAGING_BUCKET, prefix="output/")
+    return [b for b in blobs
+            if b.name.endswith(".jsonl") and not b.name.endswith(PROCESSED_SUFFIX)]
+
+
+def parse_prediction_line(line: str) -> dict | None:
+    """Parse une ligne JSONL Vertex et extrait la classification.
+    Retourne None si la ligne est mal formée (on saute, on ne casse pas tout)."""
+    try:
+        obj = json.loads(line)
+        post_id = obj.get("post_id")
+        if not post_id:
+            logger.warning("Ligne sans post_id, ignorée.")
+            return None
+
+        # Extraire le texte de la réponse Gemini (structure imbriquée)
+        response_text = (
+            obj["response"]["candidates"][0]["content"]["parts"][0]["text"]
+        )
+        # La réponse est elle-même du JSON (grâce à responseMimeType=application/json)
+        verdict = json.loads(response_text)
+
+        return {
+            "post_id": post_id,
+            "is_climate_disinfo": bool(verdict["is_climate_disinfo"]),
+            "is_climate_related": bool(verdict["is_climate_related"]),
+            "confidence": float(verdict["confidence"]),
+            "model_version": MODEL_VERSION,
+            "classified_at": datetime.now(timezone.utc).isoformat(),
+        }
+    except (KeyError, ValueError, json.JSONDecodeError) as exc:
+        logger.warning("Ligne non parseable, ignorée : %s", exc)
+        return None
+
+
+def insert_rows(rows: list) -> None:
+    """Insère les classifications dans silver.disinfo_labels.
+    Échoue bruyamment si BigQuery retourne des erreurs."""
+    if not rows:
+        return
+    client = bigquery.Client()
+    errors = client.insert_rows_json(TABLE_ID, rows)
+    if errors:
+        raise RuntimeError(f"Erreurs BigQuery : {errors}")
+    logger.info("Insérées : %d classifications dans %s", len(rows), TABLE_ID)
+
+
+def mark_as_processed(blob) -> None:
+    """Renomme le fichier en ajoutant .loaded pour ne plus le retraiter."""
+    bucket = blob.bucket
+    new_name = blob.name + PROCESSED_SUFFIX
+    bucket.rename_blob(blob, new_name)
+    logger.info("Marqué traité : gs://%s/%s", bucket.name, new_name)
+
+
+def run() -> None:
+    blobs = list_output_files()
+    if not blobs:
+        logger.info("Aucun fichier de sortie à traiter.")
+        return
+
+    logger.info("Fichiers à traiter : %d", len(blobs))
+    total_rows = 0
+
+    for blob in blobs:
+        logger.info("Traitement de gs://%s/%s", blob.bucket.name, blob.name)
+        rows = []
         for line in blob.download_as_text().splitlines():
-            obj = json.loads(line)
-            post_id = obj.get("post_id")
-            # la réponse du modèle (JSON sous forme de texte) à extraire
-            text = obj["response"]["candidates"][0]["content"]["parts"][0]["text"]
-            verdict = json.loads(text)
-            rows.append({
-                "post_id": post_id,
-                "is_climate_disinfo": verdict["is_climate_disinfo"],
-                "is_climate_related": verdict["is_climate_related"],
-                "confidence": verdict["confidence"],
-                "model_version": "gemini-2.5-flash",
-                "classified_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-            })
-    if rows:
-        bq.insert_rows_json(f"{PROJECT}.silver.disinfo_labels", rows)
-        print(f"{len(rows)} classifications chargées")
+            if not line.strip():
+                continue
+            parsed = parse_prediction_line(line)
+            if parsed:
+                rows.append(parsed)
+        insert_rows(rows)
+        total_rows += len(rows)
+        mark_as_processed(blob)
+
+    logger.info("Terminé : %d classifications chargées au total.", total_rows)
+
+
+if __name__ == "__main__":
+    try:
+        run()
+    except Exception:
+        logger.exception("Échec du chargement des résultats")
+        sys.exit(1)
 ```
+
+`requirements.txt` pour ce script :
+```
+google-cloud-bigquery
+google-cloud-storage
+```
+
+> **🎓 Concept — Marquer les fichiers traités pour l'idempotence**
+> Vertex écrit ses sorties sans nettoyer après lui. Si tu relances `load_results.py` deux fois, tu réinsérerais les mêmes lignes — pollution de la table. Le pattern de **renommage avec un suffixe `.loaded`** garantit qu'on ne retraite jamais ce qui est déjà chargé : à l'exécution suivante, ces fichiers sont filtrés. C'est simple, auditable (les `.loaded` restent visibles dans GCS), et ça ne nécessite aucune base de données annexe. Alternative possible : supprimer le fichier après traitement, ou tenir un registre BigQuery — le renommage est le compromis le plus pragmatique.
 
 > **🎓 Concept — Tracer la version du modèle**
 > On stocke `model_version` avec chaque classification. Le jour où Gemini change de version et que les résultats bougent, tu sauras quelles données ont été produites par quel modèle. La **traçabilité** (lineage) est une obsession saine d'architecte.
 
-> **🤔 Pour aller plus loin :** que faire si Gemini renvoie un JSON malformé pour un post ? Réponse : entourer le `json.loads(text)` d'un try/except, logguer le `post_id` en échec, et le laisser non classé — le prochain batch le reprendra (idempotence). Un post problématique ne doit jamais faire échouer tout le chargement.
+> **🎓 Concept — Échouer bruyant ou silencieux : selon la cause**
+> Deux philosophies cohabitent dans ce script. **Bruyant sur ce qui doit alerter** : si `insert_rows_json` retourne des erreurs (table inexistante, schéma incompatible), on `raise` — Cloud Workflows verra l'erreur, l'alerte Monitoring se déclenche. **Silencieux sur ce qui se rattrape** : si une ligne Gemini est mal formée (sur des milliers ça arrive), on logue un warning et on saute — le post non traité reste avec `disinfo_labels.post_id IS NULL`, donc le prochain run de `prepare_and_launch.py` le reprendra naturellement. L'idempotence du pipeline absorbe les pannes locales. *Choisir où échouer fort et où échouer doux est une décision d'architecte.*
 
-### 4.5 Orchestrer proprement avec Cloud Workflows
+> **🎓 Concept — Forcer les types au parsing**
+> Note les `bool(verdict["is_climate_disinfo"])` et `float(verdict["confidence"])`. Gemini *devrait* renvoyer du booléen et du nombre, mais peut parfois produire des chaînes `"true"` ou `"0.85"` selon les variations de prompt. Forcer les types évite des erreurs silencieuses d'insertion BigQuery, qui exige un schéma strict. Détail de robustesse à connaître.
+
+#### Vérifier le chargement
+
+```bash
+# Vérifier qu'il y a bien des fichiers de sortie produits par Vertex
+gcloud storage ls -r gs://${PROJECT_ID}-vertex-staging/output/
+
+# Lancer le chargement (en local pour tester)
+export PROJECT_ID="climat-desinformation-bluesky"
+cd classification && python load_results.py
+
+# Vérifier le résultat en BigQuery
+bq query --use_legacy_sql=false \
+  "SELECT COUNT(*) AS n, AVG(confidence) AS conf
+   FROM \`${PROJECT_ID}.silver.disinfo_labels\`"
+
+# Vérifier que les fichiers ont bien été marqués
+gcloud storage ls -r gs://${PROJECT_ID}-vertex-staging/output/ | grep "\.loaded$"
+```
+
+### 4.4 Orchestrer proprement avec Cloud Workflows
 
 > **🎓 Concept — Pourquoi un orchestrateur est non négociable**
 > Jusqu'ici, chaque tâche est déclenchée par Cloud Scheduler à heure fixe. Le problème : ces tâches ont des **dépendances** (la classification a besoin des posts ingérés et transformés ; le gold a besoin des labels). Espérer que « l'ingestion de 6h00 soit finie avant la classification de 6h15 » est un pari — et un job de Batch Prediction dure un temps **variable** (5 min ou 2h selon le volume). Compter sur des horaires fixes pour gérer des dépendances, c'est un pipeline qui casse en production. La solution : un **orchestrateur** qui enchaîne explicitement, attend la fin réelle de chaque étape, et gère les erreurs.
@@ -867,6 +1142,11 @@ main:
         result: df_silver
 
     # 3. Prépare le fichier JSONL pour Vertex
+    # ⚠ En orchestration Workflows, on n'exécute QUE la préparation côté Cloud Run.
+    # Le lancement du batch se fait à l'étape suivante (4) par le Workflow lui-même,
+    # qui récupère ainsi le resource_name nécessaire au polling (étape 5).
+    # Cela correspond à utiliser une variante de prepare_and_launch.py qui ne fait
+    # que la préparation (--no-launch, ou un module prepare_only.py).
     - prepare_jsonl:
         call: googleapis.run.v1.namespaces.jobs.run
         args:
@@ -1193,8 +1473,8 @@ Ajoute une section honnête « Limites & ce que je ferais différemment » :
 | Intégration d'un LLM en production | Gemini Batch Prediction, étape 4 |
 | Pilotage d'un LLM (prompt, temperature, JSON) | Étape 4 |
 | Maîtrise des coûts cloud | Jobs éphémères, batch -50 %, idempotence |
-| FinOps : arbitrage Workflows vs Composer | Étape 4.5 |
-| Orchestration & gestion de l'asynchrone (polling) | Cloud Workflows, étape 4.5 |
+| FinOps : arbitrage Workflows vs Composer | Étape 4.4 |
+| Orchestration & gestion de l'asynchrone (polling) | Cloud Workflows, étape 4.4 |
 | Observabilité (run, pas seulement build) | Log-based metrics + alertes, étape 5 |
 | Infrastructure-as-Code | Encadrés Terraform |
 | CI/CD & traçabilité des déploiements | Cloud Build, tag par commit, étape 5 |
