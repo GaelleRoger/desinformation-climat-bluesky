@@ -31,6 +31,8 @@ def get_unclassified(limit=5000):  #modifiée pour initialiser disinfo label
     q = f"""
         SELECT p.post_id, p.texte
         FROM `{PROJECT}.silver.posts_clean` p
+        LEFT JOIN `{PROJECT}.silver.disinfo_labels` d USING (post_id)
+        WHERE d.post_id IS NULL
         LIMIT {limit}
     """
     return list(bq.query(q, location=REGION).result())

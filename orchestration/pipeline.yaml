@@ -1,0 +1,113 @@
+# Pipeline Cloud Workflows
+
+main:
+  steps:
+    - init:
+        assign:
+          - project: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+          - region: "europe-west1"
+
+    # 1. Ingestion des posts (exécute le Cloud Run Job et attend sa fin)
+    - ingest_posts:
+        call: googleapis.run.v1.namespaces.jobs.run
+        args:
+          name: ${"namespaces/" + project + "/jobs/ingest-posts"}
+          location: ${region}
+        result: ingest_result
+
+    # 2. Dataform : compile le repository pour obtenir un compilationResult
+    - compile_dataform:
+        call: http.post
+        args:
+          url: ${"https://dataform.googleapis.com/v1beta1/projects/" + project + "/locations/" + region + "/repositories/climat-meteo/compilationResults"}
+          auth: { type: OAuth2 }
+          body:
+            workspace: ${"projects/" + project + "/locations/" + region + "/repositories/climat-meteo/workspaces/default"}
+        result: compilation_response
+    - extract_compilation_id:
+        assign:
+          - compilation_id: ${compilation_response.body.name}
+
+    # 3. Dataform : exécute le workflow silver (bronze → silver)
+    - run_dataform_silver:
+        call: http.post
+        args:
+          url: ${"https://dataform.googleapis.com/v1beta1/projects/" + project + "/locations/" + region + "/repositories/climat-meteo/workflowInvocations"}
+          auth: { type: OAuth2 }
+          body:
+            compilationResult: ${compilation_id}
+            invocationConfig:
+              includedTags:
+                - "silver"
+        result: df_silver
+
+    # 4. Prépare le fichier JSONL pour Vertex
+    # ⚠ En orchestration Workflows, on n'exécute QUE la préparation côté Cloud Run.
+    # Le lancement du batch se fait à l'étape suivante (5) par le Workflow lui-même,
+    # qui récupère ainsi le resource_name nécessaire au polling (étape 6).
+    - prepare_jsonl:
+        call: googleapis.run.v1.namespaces.jobs.run
+        args:
+          name: ${"namespaces/" + project + "/jobs/prepare-classification"}
+          location: ${region}
+
+    # 5. Lance le Batch Prediction (retourne un job EN COURS)
+    - launch_batch:
+        call: googleapis.aiplatform.v1.projects.locations.batchPredictionJobs.create
+        args:
+          parent: ${"projects/" + project + "/locations/" + region}
+          region: ${region}
+          body:
+            displayName: "disinfo-classification"
+            model: "publishers/google/models/gemini-2.5-flash"
+            inputConfig:
+              instancesFormat: "jsonl"
+              gcsSource:
+                uris:
+                  - ${"gs://" + project + "-vertex-staging/input/batch.jsonl"}
+            outputConfig:
+              predictionsFormat: "jsonl"
+              gcsDestination:
+                outputUriPrefix: ${"gs://" + project + "-vertex-staging/output/"}
+          connector_params:
+            location: ${region}
+        result: batch_job
+
+    # 6. ⏳ POLLING : boucle jusqu'à complétion du job
+    - wait_for_batch:
+        steps:
+          - check_status:
+              call: googleapis.aiplatform.v1.projects.locations.batchPredictionJobs.get
+              args:
+                name: ${batch_job.name}
+                region: ${region}
+              result: job_status
+          - evaluate:
+              switch:
+                - condition: ${job_status.state == "JOB_STATE_SUCCEEDED"}
+                  next: load_results
+                - condition: ${job_status.state in ["JOB_STATE_FAILED", "JOB_STATE_CANCELLED"]}
+                  raise: '${"Batch job failed - " + job_status.state}'
+          - pause:
+              call: sys.sleep
+              args: { seconds: 60 }
+              next: check_status
+
+    # 7. Charge les résultats en silver
+    - load_results:
+        call: googleapis.run.v1.namespaces.jobs.run
+        args:
+          name: ${"namespaces/" + project + "/jobs/load-classification"}
+          location: ${region}
+
+    # 8. Dataform : exécute le workflow gold (silver → gold)
+    - run_dataform_gold:
+        call: http.post
+        args:
+          url: ${"https://dataform.googleapis.com/v1beta1/projects/" + project + "/locations/" + region + "/repositories/climat-meteo/workflowInvocations"}
+          auth: { type: OAuth2 }
+          body:
+            compilationResult: ${compilation_id}
+            invocationConfig:
+              includedTags:
+                - "gold"
