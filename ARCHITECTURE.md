@@ -123,6 +123,21 @@ Architecture **lakehouse en médaillon (medallion)**, entièrement orientée **b
 
 > **Pourquoi pas du streaming pur (firehose/Jetstream) ?** Considéré et écarté. Le firehose imposait un consumer WebSocket permanent (Cloud Run facturé en continu, principal poste de coût) pour un bénéfice marginal : à l'échelle d'un sujet de niche comme le climat en français, l'API `searchPosts` en micro-batch capture l'essentiel des posts avec une latence de quelques minutes, sans process permanent. Choix assumé de simplicité et de coût.
 
+### 3.3 Diagrammes détaillés (Mermaid)
+
+Le schéma d'ensemble (`docs/images/architecture_v3.png`) donne la vue macro. Pour creuser, deux diagrammes Mermaid complémentaires sont maintenus dans `docs/diagrams/` :
+
+- **`data-flow.mmd`** — vue orientée **flux de données** : chaque bucket GCS, chaque table BigQuery et chaque job nommé, du firehose au dashboard. Détaille notamment le pattern d'échange JSONL avec Vertex Batch Prediction.
+- **`industrialization.mmd`** — vue orientée **exploitation** : orchestration Cloud Workflows au centre (avec la boucle de polling matérialisée), identité et secrets transverses, observabilité et canaux d'alerte.
+
+Ces diagrammes sont écrits en Mermaid pour trois raisons :
+
+1. **Versionnable dans Git** — texte, diffable, revu en pull-request comme du code. Contrairement à un PNG, on voit exactement ce qui a changé entre deux versions.
+2. **Rendu natif GitHub** — les blocs ```` ```mermaid ```` s'affichent directement dans le README et les issues, sans dépendance à un outil externe.
+3. **Deux angles complémentaires** — un architecte lit le pipeline sous plusieurs angles : « par où passent les données » et « comment ça s'exploite ». Un seul diagramme mélangeant les deux devient rapidement illisible.
+
+> **Note d'architecte :** le PNG et les Mermaid ne sont pas redondants — ils répondent à des questions différentes. Le PNG donne l'impression générale en une seconde ; les Mermaid permettent de zoomer sur une brique précise (« comment fonctionne exactement le polling Vertex ? »). C'est le même pattern qu'en documentation logicielle : une vue haute et des vues détaillées.
+
 ---
 
 ## 4. Choix techniques justifiés
