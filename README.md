@@ -27,30 +27,28 @@
 
 ## Problématique
 
-Les vagues de discours climato-sceptique en ligne semblent réagir aux événements météorologiques : une vague de froid intense déclenche-t-elle une recrudescence de posts niant le réchauffement climatique (« et le réchauffement alors ? ») ? Une canicule provoque-t-elle au contraire des posts d'inquiétude climatique ?
+Les vagues de discours climato-sceptique en ligne semblent réagir aux événements météorologiques : une vague de froid intense déclenche-t-elle une recrudescence de posts niant le réchauffement climatique (« et le réchauffement alors ? ») ? Une canicule provoque-t-elle au contraire des posts d'inquiétude climatique ou un regain deposts climato-sceptiques ?
 
 **Enjeux :**
 - Les associations de fact-checking climat comme [Quota Climat](https://quotaclimat.org/) ou [Les Shifters](https://www.theshifters.org/) mobilisent des bénévoles pour analyser et répondre à la désinformation climatique sur les réseaux sociaux. Anticiper les pics de volume permettrait de mieux planifier ces mobilisations.
-- Il n'existe pas d'outil grand public reliant les conditions météorologiques réelles au volume et à la nature du discours climatique en ligne — les études existantes sont ponctuelles, académiques et pas actionnables opérationnellement.
-- Les APIs sociales fermées (X, Reddit payant) rendent difficile ce type d'analyse à l'échelle. Bluesky, réseau ouvert avec un firehose public, ouvre une opportunité méthodologique.
-
+ 
 ## Solution
 
 Un pipeline ELT industrialisé sur GCP qui ingère les posts Bluesky en français mentionnant le climat, les classe en désinformation climatique OUI/NON via Gemini (Vertex AI Batch Prediction), et les croise quotidiennement avec la météo de Paris pour produire une table analytique et un dashboard.
 
-**Positionnement :** projet d'**architecture de données** (pas d'affirmations scientifiques sur la corrélation elle-même). Le livrable est le pipeline reproductible, industrialisé et documenté — le dashboard est un artefact démonstratif de ce que ce pipeline permettrait à un partenaire associatif de suivre en continu.
+**Positionnement :Il s'agit d'un ** projet d'**architecture de données** (pas d'affirmations scientifiques sur la corrélation elle-même). Le livrable est le pipeline reproductible, industrialisé et documenté — le dashboard est uniquement un exemple de ce que ce pipeline rend possible.
 
 ---
 
 ## Fonctionnalités
 
 - **Ingestion micro-batch (15 min)** : consumer Cloud Run Jobs sur l'API Bluesky `searchPosts`, filtrage `lang=fr` + termes climat côté serveur, dédoublonnage.
-- **Data lake GCS partitionné** : posts et météo bruts en JSONL immuable, tables externes BigQuery pour requêter sans dupliquer.
+- **Data lake GCS partitionné** : posts et météo bruts en JSONL, tables externes BigQuery pour requêter sans dupliquer.
 - **Modélisation ELT en couches médaillon** : Dataform orchestre bronze → silver → gold avec assertions qualité (unicité, non-nullité).
-- **Classification de désinformation via Gemini Batch Prediction** : SDK Python, prompt de classification zero-shot, mode batch (-50 % tokens vs temps réel), champs garde-fous (`is_climate_related`, `confidence`).
+- **Classification de désinformation via Gemini Batch Prediction** : SDK Python, prompt de classification, mode batch (-50 % tokens vs temps réel), champs garde-fous (`is_climate_related`, `confidence`).
 - **Orchestration robuste par Cloud Workflows** : polling du job Vertex à durée variable, gestion des dépendances entre étapes, un seul déclencheur Cloud Scheduler.
-- **Observabilité** : log-based metrics sur les erreurs Workflow et les échecs d'assertions Dataform, alertes Cloud Monitoring vers webhook Discord + email.
-- **Secrets sous contrôle** : identifiants Bluesky et OpenWeatherMap dans Secret Manager, comptes de service au moindre privilège.
+- **Observabilité** : log-based metrics sur les erreurs Workflow et les échecs d'assertions Dataform, alertes Cloud Monitoring via email.
+- **Secrets** : identifiants Bluesky et OpenWeatherMap dans Secret Manager, comptes de service au moindre privilège.
 
 ---
 
@@ -59,15 +57,14 @@ Un pipeline ELT industrialisé sur GCP qui ingère les posts Bluesky en françai
 | Couche | Technologies |
 | --- | --- |
 | **Sources** | Bluesky API (`searchPosts`), OpenWeatherMap |
-| **Ingestion** | Cloud Run Jobs (Python 3.11, Docker), Cloud Scheduler |
-| **Stockage brut** | Cloud Storage (data lake bronze, JSONL partitionné Hive-style) |
+| **Ingestion** | Cloud Run Jobs (Python, Docker), Cloud Scheduler |
+| **Stockage brut** | Cloud Storage (data lake bronze, JSONL partitionné) |
 | **Entrepôt & transformations** | BigQuery (tables externes), Dataform (SQL + assertions) |
 | **ML managé** | Vertex AI Batch Prediction, Gemini 2.5 Flash |
-| **Orchestration** | Cloud Workflows (polling asynchrone) |
-| **Observabilité** | Cloud Logging (log-based metrics), Cloud Monitoring, Discord webhook |
+| **Orchestration** | Cloud Workflows |
+| **Observabilité** | Cloud Logging (log-based metrics), Cloud Monitoring |
 | **Sécurité** | Secret Manager, IAM comptes de service dédiés |
 | **Restitution** | Looker Studio |
-| **Industrialisation documentée** | Terraform (encadrés IaC), Cloud Build (CI/CD) |
 
 ---
 
@@ -77,24 +74,13 @@ Vue d'ensemble :
 
 ![Architecture](docs/images/architecture_v3.png)
 
-<details>
-<summary><b>Diagrammes détaillés (Mermaid)</b></summary>
-
-Deux vues complémentaires, versionnées dans `docs/diagrams/` :
-
-- [`data-flow.mmd`](docs/diagrams/data-flow.mmd) — flux de données : buckets GCS, tables BigQuery, jobs individuels et échanges JSONL avec Vertex.
-- [`industrialization.mmd`](docs/diagrams/industrialization.mmd) — orchestration Cloud Workflows (polling), sécurité transverse, chaîne d'observabilité.
-
-</details>
-
 Pour la conception détaillée (choix techniques justifiés, modèle de données, stratégie FinOps) : [`ARCHITECTURE.md`](ARCHITECTURE.md).
-Pour la démarche pas-à-pas : [`TUTORIEL.md`](TUTORIEL.md).
 
 ---
 
 ## Résultats & limites
 
-### Ce qui est mesurable
+### Quelques chiffres
 
 | Indicateur | Valeur | Contexte |
 | --- | --- | --- |
@@ -103,14 +89,14 @@ Pour la démarche pas-à-pas : [`TUTORIEL.md`](TUTORIEL.md).
 | Latence bout-en-bout | ~15-20 min | De la publication d'un post à sa présence en silver |
 | Réduction coût ML | -50 % tokens | Batch Prediction vs appels temps réel Gemini |
 
-### Ce qui ne l'est pas (honnêteté méthodologique)
+### Limites
 
 - **Pas de precision/recall du classifieur** : aucun jeu de test annoté humainement. La qualité de la classification est estimée par le modèle lui-même (champ `confidence`), pas validée.
 - **Pas de « désinformation » au sens fact-checké** : la sortie du modèle est une **estimation automatique** selon une définition opérationnelle donnée en prompt, pas un verdict de véracité.
 - **Proxy géographique grossier** : les posts en français sont croisés avec la météo de Paris. Un francophone peut poster depuis le Québec ou la Belgique.
 - **Couverture non exhaustive** : l'API `searchPosts` avec filtrage par termes ne capture qu'une fraction du discours climatique — on raisonne en tendances relatives, pas en volumes absolus.
 
-Ces limites sont **assumées et documentées** dans [`ARCHITECTURE.md`](ARCHITECTURE.md) — un pipeline honnête sur ses angles morts est plus utile qu'un chiffre inventé.
+Ces limites sont également **documentées** dans [`ARCHITECTURE.md`](ARCHITECTURE.md) 
 
 ---
 
@@ -153,10 +139,7 @@ printf "votre.handle.bsky.social" | gcloud secrets create bsky-handle --data-fil
 printf "xxxx-xxxx-xxxx-xxxx"      | gcloud secrets create bsky-app-password --data-file=-
 printf "votre_cle_owm"             | gcloud secrets create owm-api-key --data-file=-
 
-# 4. Suivre TUTORIEL.md pour la mise en place complète des jobs, Dataform et Workflows
 ```
-
-Prêt en environ **30 minutes** pour un premier run d'ingestion (le tutoriel détaille chaque étape avec les concepts sous-jacents).
 
 ---
 
@@ -181,14 +164,12 @@ Prêt en environ **30 minutes** pour un premier run d'ingestion (le tutoriel dé
 ## Documentation
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — document d'architecture détaillé (choix techniques justifiés, modèle de données, FinOps, industrialisation, glossaire).
-- [`TUTORIEL.md`](TUTORIEL.md) — guide pas-à-pas expliquant chaque brique avec les concepts d'architecte qui la sous-tendent.
-- [`docs/diagrams/`](docs/diagrams/) — diagrammes Mermaid interactifs (data flow et industrialisation).
 
 ---
 
 ## Contact
 
-**Gaëlle Roger** — Data Analyst en transition vers Data Architect
+**Gaëlle Roger** — Data Engineer / Data Architect
 [LinkedIn](https://www.linkedin.com/in/VOTRE_PROFIL) · [Email](mailto:VOTRE_EMAIL)
 
 Les issues et pull requests sont les bienvenues pour toute suggestion d'amélioration architecturale ou méthodologique.
