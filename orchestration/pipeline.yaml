@@ -7,7 +7,7 @@ main:
           - project: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
           - region: "europe-west1"
 
-    # 1. Ingestion des posts (exécute le Cloud Run Job et attend sa fin)
+    # 1. Ingestion des posts
     - ingest_posts:
         call: googleapis.run.v1.namespaces.jobs.run
         args:
@@ -15,43 +15,48 @@ main:
           location: ${region}
         result: ingest_result
 
-    # 2. Dataform : compile le repository pour obtenir un compilationResult
+    # 2. Dataform : compile le workspace pour obtenir un compilationResult
     - compile_dataform:
         call: http.post
         args:
           url: ${"https://dataform.googleapis.com/v1beta1/projects/" + project + "/locations/" + region + "/repositories/climat-meteo/compilationResults"}
-          auth: { type: OAuth2 }
+          auth:
+            type: OAuth2
           body:
             workspace: ${"projects/" + project + "/locations/" + region + "/repositories/climat-meteo/workspaces/default"}
         result: compilation_response
+
     - extract_compilation_id:
         assign:
           - compilation_id: ${compilation_response.body.name}
 
-    # 3. Dataform : exécute le workflow silver (bronze → silver)
+    # 3. Dataform : bronze → silver (posts_clean, weather_daily)
     - run_dataform_silver:
         call: http.post
         args:
           url: ${"https://dataform.googleapis.com/v1beta1/projects/" + project + "/locations/" + region + "/repositories/climat-meteo/workflowInvocations"}
-          auth: { type: OAuth2 }
+          auth:
+            type: OAuth2
           body:
             compilationResult: ${compilation_id}
             invocationConfig:
-              includedTags:
-                - "silver"
+              includedTargets:
+                - database: ${project}
+                  schema: "silver"
+                  name: "posts_clean"
+                - database: ${project}
+                  schema: "silver"
+                  name: "weather_daily"
         result: df_silver
 
     # 4. Prépare le fichier JSONL pour Vertex
-    # ⚠ En orchestration Workflows, on n'exécute QUE la préparation côté Cloud Run.
-    # Le lancement du batch se fait à l'étape suivante (5) par le Workflow lui-même,
-    # qui récupère ainsi le resource_name nécessaire au polling (étape 6).
     - prepare_jsonl:
         call: googleapis.run.v1.namespaces.jobs.run
         args:
           name: ${"namespaces/" + project + "/jobs/prepare-classification"}
           location: ${region}
 
-    # 5. Lance le Batch Prediction (retourne un job EN COURS)
+    # 5. Lance le Batch Prediction
     - launch_batch:
         call: googleapis.aiplatform.v1.projects.locations.batchPredictionJobs.create
         args:
@@ -73,7 +78,7 @@ main:
             location: ${region}
         result: batch_job
 
-    # 6. ⏳ POLLING : boucle jusqu'à complétion du job
+    # 6. Polling : boucle jusqu'à complétion du job
     - wait_for_batch:
         steps:
           - check_status:
@@ -90,7 +95,7 @@ main:
                   raise: '${"Batch job failed - " + job_status.state}'
           - pause:
               call: sys.sleep
-              args: { seconds: 60 }
+              args: {seconds: 60}
               next: check_status
 
     # 7. Charge les résultats en silver
@@ -100,14 +105,20 @@ main:
           name: ${"namespaces/" + project + "/jobs/load-classification"}
           location: ${region}
 
-    # 8. Dataform : exécute le workflow gold (silver → gold)
+    # 8. Dataform : silver → gold (daily_disinfo, climate_x_weather)
     - run_dataform_gold:
         call: http.post
         args:
           url: ${"https://dataform.googleapis.com/v1beta1/projects/" + project + "/locations/" + region + "/repositories/climat-meteo/workflowInvocations"}
-          auth: { type: OAuth2 }
+          auth:
+            type: OAuth2
           body:
             compilationResult: ${compilation_id}
             invocationConfig:
-              includedTags:
-                - "gold"
+              includedTargets:
+                - database: ${project}
+                  schema: "gold"
+                  name: "daily_disinfo"
+                - database: ${project}
+                  schema: "gold"
+                  name: "climate_x_weather"

@@ -95,7 +95,10 @@ def run():
         return
     print(f"{len(rows)} posts à classer.")
     jsonl_uri = upload_jsonl(build_jsonl(rows))
-    launch_batch_job(jsonl_uri)
+    # En mode orchestré (Cloud Workflows), le batch est lancé par le workflow.
+    # Mettre LAUNCH_BATCH=false pour désactiver le lancement depuis ce script.
+    if os.environ.get("LAUNCH_BATCH", "true").lower() != "false":
+        launch_batch_job(jsonl_uri)
 
 if __name__ == "__main__":
     run()
