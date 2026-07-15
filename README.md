@@ -36,7 +36,7 @@ Les vagues de discours climato-sceptique en ligne semblent réagir aux événeme
 
 Un pipeline ELT industrialisé sur GCP qui ingère les posts Bluesky en français mentionnant le climat, les classe en désinformation climatique OUI/NON via Gemini (Vertex AI Batch Prediction), et les croise quotidiennement avec la météo de Paris pour produire une table analytique et un dashboard.
 
-**Positionnement :Il s'agit d'un ** projet d'**architecture de données** (pas d'affirmations scientifiques sur la corrélation elle-même). Le livrable est le pipeline reproductible, industrialisé et documenté — le dashboard est uniquement un exemple de ce que ce pipeline rend possible.
+**Positionnement** :Il s'agit d'un projet d'**architecture de données** (pas d'affirmations scientifiques sur la corrélation elle-même). Le livrable est le pipeline reproductible, industrialisé et documenté — le dashboard est uniquement un exemple de ce que ce pipeline rend possible.
 
 ---
 
