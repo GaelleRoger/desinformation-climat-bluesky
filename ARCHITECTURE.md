@@ -2,13 +2,9 @@
 
 > Pipeline pseudo-temps-réel (micro-batch) sur Google Cloud Platform classant les posts Bluesky relatifs au climat (désinformation climatique : OUI/NON) et les croisant avec des données météo réelles.
 
-**Auteur :** [Ton nom]
-**Version :** 3.0
+**Auteur :** Gaëlle Roger
 **Date :** Mai 2026
 **Statut :** Document de conception
-
-> **Changements v3.0 :** ajout de la couche d'**industrialisation** (section 4bis) — orchestration **Cloud Workflows** avec polling du Batch Prediction, **observabilité** (log-based metrics + alertes Discord/email), **Terraform** en regard des ressources clés, **CI/CD** Cloud Build.
-> **v2.0 :** ingestion micro-batch via `searchPosts`, couche bronze en data lake GCS, Secret Manager, classification de désinformation via Gemini Batch Prediction.
 
 ---
 
@@ -26,7 +22,7 @@ Ce projet construit un pipeline de données permettant de **mesurer la relation 
 
 ### 1.3 Objectif technique
 
-Démontrer la conception et l'implémentation d'un **pipeline de données end-to-end** sur GCP, avec une ingestion pseudo-temps-réel (micro-batch), une architecture **lakehouse** (data lake GCS + entrepôt BigQuery), une modélisation ELT en couches, un enrichissement ML managé par **classification**, et une restitution analytique. L'accent est mis sur la **qualité architecturale** : séparation des responsabilités, gestion des secrets, justification des choix, maîtrise des coûts, et qualité des données.
+Démontrer la conception et l'implémentation d'un **pipeline de données end-to-end** sur GCP, avec une ingestion pseudo-temps-réel (micro-batch), une architecture **lakehouse** (data lake GCS + entrepôt BigQuery), une modélisation ELT en couches, un enrichissement ML managé par **classification**, et une restitution analytique. L'accent est mis sur l' **architecture** : séparation des responsabilités, gestion des secrets, justification des choix, maîtrise des coûts, et qualité des données.
 
 ---
 
@@ -45,13 +41,11 @@ Démontrer la conception et l'implémentation d'un **pipeline de données end-to
 
 | Hypothèse | Justification | Limite |
 |---|---|---|
-| **Posts FR = météo de Paris** | Les posts Bluesky n'ont quasiment jamais de géolocalisation. On utilise la langue comme proxy géographique grossier. | Un utilisateur francophone peut être au Québec, en Belgique, en Afrique. La météo de Paris n'est qu'une approximation du « ressenti météo » de l'audience. Simplification méthodologique explicite. |
+| **Posts FR = météo de Paris** | Les posts Bluesky n'ont quasiment jamais de géolocalisation. On utilise la langue comme proxy géographique grossier. | Un utilisateur francophone peut être au Québec, en Belgique, en Afrique. La météo de Paris n'est qu'une approximation du « ressenti météo » de l'audience. Simplification méthodologique. |
 | **Détection du climat par termes de recherche** | L'API `searchPosts` filtre par mots-clés ; approche simple et transparente. | Risque de faux positifs (« climat social ») et faux négatifs (posts implicites). Atténué par le champ `is_climate_related` produit par le classifieur. |
 | **Classification = jugement d'un LLM** | Gemini classe selon un prompt explicite, sans jeu d'entraînement annoté. | La sortie est une estimation, pas une vérité de terrain. On conserve un score de `confidence` et on documente le caractère faillible. Ce n'est pas un fact-checking certifié. |
 | **« Désinformation » est défini par le prompt** | On encadre la définition dans la consigne donnée au modèle. | La frontière désinfo/opinion/ironie est intrinsèquement floue. On assume une définition opérationnelle, documentée et critiquable. |
 | **Couverture non exhaustive** | `searchPosts` + filtrage par termes ne capturent qu'une partie des posts. | On raisonne en tendances relatives, pas en volumes absolus. |
-
-> **Note d'architecte :** documenter explicitement les limites n'est pas un aveu de faiblesse — c'est ce qui distingue une analyse rigoureuse d'une analyse naïve. La classification de « désinformation » est un sujet sensible : annoncer clairement qu'il s'agit d'une estimation automatique faillible, et non d'un verdict, est à la fois honnête et un signal de maturité.
 
 ---
 
@@ -59,98 +53,28 @@ Démontrer la conception et l'implémentation d'un **pipeline de données end-to
 
 ### 3.1 Schéma de flux
 
-```
-┌──────────────────────────────────────────────────────────────────────────┐
-│                            SOURCES EXTERNES                                 │
-│   ┌──────────────────────────┐          ┌────────────────────────────┐      │
-│   │  Bluesky API             │          │   OpenWeatherMap API       │      │
-│   │  app.bsky.feed.searchPosts│         │   (REST, batch quotidien)  │      │
-│   │  (REST, auth app password)│         │                            │      │
-│   └────────────┬─────────────┘          └─────────────┬──────────────┘      │
-└────────────────┼──────────────────────────────────────┼────────────────────┘
-                 │ HTTPS (micro-batch 5-15 min)          │ HTTPS (1×/jour)
-                 │                                        │
-        ┌────────┴─────────┐                    ┌─────────┴────────┐
-        │ secrets lus via  │                    │ clé lue via      │
-        │ Secret Manager   │                    │ Secret Manager   │
-        ▼                  │                    ▼                  │
-┌──────────────────────────┐              ┌────────────────────────────┐
-│  INGESTION POSTS         │              │  INGESTION MÉTÉO           │
-│  Cloud Run Job (planifié)│              │  Cloud Run Job (planifié)  │
-│  - auth Bluesky          │              │  - appel OWM Paris         │
-│  - recherche par termes  │              │  - écrit 1 fichier/jour    │
-│  - dédup, écrit fichiers │              └─────────────┬──────────────┘
-└────────────┬─────────────┘                            │
-             │ écrit JSON horodaté                       │ écrit JSON
-             ▼                                           ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│                    GOOGLE CLOUD STORAGE — bronze (data lake)              │
-│   gs://…-bronze-posts/dt=YYYY-MM-DD/posts_HHMM.json   (source immuable)   │
-│   gs://…-bronze-weather/dt=YYYY-MM-DD/weather.json    (source immuable)   │
-└───────┬──────────────────────────────────────────────────────────────────┘
-        │ tables externes / load
-        ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│                          BIGQUERY                                        │
-│   ┌──────────────┐     ┌─────────────┐     ┌───────────────┐             │
-│   │ BRONZE (ext.)│────▶│   SILVER    │────▶│     GOLD      │             │
-│   │ posts_ext    │     │ posts_clean │     │ daily_disinfo │             │
-│   │ weather_ext  │     │ weather_day │     │ climate_x_    │             │
-│   └──────────────┘     └──────┬──────┘     │   weather     │             │
-│                               │             └──────▲────────┘             │
-│         ┌─────────────────────┘                    │ Dataform            │
-│         ▼                                           │                     │
-│   ┌─────────────────────┐                           │                     │
-│   │ CLASSIFICATION      │  Vertex AI Batch Prediction│                    │
-│   │ (Gemini)            │  via gs://…-vertex-staging │                    │
-│   │ → disinfo_labels    │  (JSONL in/out, éphémère)  │                    │
-│   └─────────────────────┘───────────────────────────┘                     │
-└──────────────────────────────────────────────────────┬─────────────────────┘
-                                                        ▼
-                                           ┌────────────────────────┐
-                                           │     Looker Studio      │
-                                           │  Dashboard analytique  │
-                                           └────────────────────────┘
-```
+
 
 ### 3.2 Style architectural
 
 Architecture **lakehouse en médaillon (medallion)**, entièrement orientée **batch / micro-batch** :
 
-- **Lakehouse** : la donnée brute vit dans un data lake objet (GCS), interrogée par l'entrepôt (BigQuery) via des tables externes. La donnée brute ne dépend d'aucun moteur de requête — on pourrait la relire avec Spark, DuckDB, etc.
-- **Micro-batch (et non streaming pur)** : l'API `searchPosts` est interrogée fréquemment (toutes les 5-15 min) par un job planifié. On obtient un « quasi temps réel » sans la complexité ni le coût d'un consumer WebSocket permanent.
-- **Médaillon (bronze/silver/gold)** : séparation stricte entre données brutes immuables (GCS), données nettoyées (silver), et données prêtes pour l'analyse (gold). Colonne vertébrale de la maintenabilité.
+- **Lakehouse** : la donnée brute vit dans un data lake objet (GCS), interrogée par l'entrepôt (BigQuery) via des tables externes. 
+- **Micro-batch (et non streaming pur)** : l'API `searchPosts` est interrogée fréquemment (toutes les 5-15 min) par un job planifié. On obtient un « quasi temps réel » sans la complexité ni le coût du streaming pur.
+- **Médaillon (bronze/silver/gold)** : séparation stricte entre données brutes immuables (GCS), données nettoyées (silver), et données prêtes pour l'analyse (gold).
 
 > **Pourquoi pas du streaming pur (firehose/Jetstream) ?** Considéré et écarté. Le firehose imposait un consumer WebSocket permanent (Cloud Run facturé en continu, principal poste de coût) pour un bénéfice marginal : à l'échelle d'un sujet de niche comme le climat en français, l'API `searchPosts` en micro-batch capture l'essentiel des posts avec une latence de quelques minutes, sans process permanent. Choix assumé de simplicité et de coût.
-
-### 3.3 Diagrammes détaillés (Mermaid)
-
-Le schéma d'ensemble (`docs/images/architecture_v3.png`) donne la vue macro. Pour creuser, deux diagrammes Mermaid complémentaires sont maintenus dans `docs/diagrams/` :
-
-- **`data-flow.mmd`** — vue orientée **flux de données** : chaque bucket GCS, chaque table BigQuery et chaque job nommé, du firehose au dashboard. Détaille notamment le pattern d'échange JSONL avec Vertex Batch Prediction.
-- **`industrialization.mmd`** — vue orientée **exploitation** : orchestration Cloud Workflows au centre (avec la boucle de polling matérialisée), identité et secrets transverses, observabilité et canaux d'alerte.
-
-Ces diagrammes sont écrits en Mermaid pour trois raisons :
-
-1. **Versionnable dans Git** — texte, diffable, revu en pull-request comme du code. Contrairement à un PNG, on voit exactement ce qui a changé entre deux versions.
-2. **Rendu natif GitHub** — les blocs ```` ```mermaid ```` s'affichent directement dans le README et les issues, sans dépendance à un outil externe.
-3. **Deux angles complémentaires** — un architecte lit le pipeline sous plusieurs angles : « par où passent les données » et « comment ça s'exploite ». Un seul diagramme mélangeant les deux devient rapidement illisible.
-
-> **Note d'architecte :** le PNG et les Mermaid ne sont pas redondants — ils répondent à des questions différentes. Le PNG donne l'impression générale en une seconde ; les Mermaid permettent de zoomer sur une brique précise (« comment fonctionne exactement le polling Vertex ? »). C'est le même pattern qu'en documentation logicielle : une vue haute et des vues détaillées.
 
 ---
 
 ## 4. Choix techniques justifiés
 
-Chaque brique répond à un « pourquoi celle-ci et pas une autre ».
-
 ### 4.1 Source posts : API `searchPosts` (micro-batch)
 
 | Option | Avantages | Inconvénients | Verdict |
 |---|---|---|---|
-| **`searchPosts` en micro-batch (retenu)** | Filtrage par termes + langue côté serveur, pas de process permanent, simple, pagination par curseur | Pas du temps réel strict (latence de quelques min), rate limits à gérer | ✅ |
+| **`searchPosts` en micro-batch (retenu)** | Filtrage par termes + langue côté serveur | Pas du temps réel strict (latence de quelques min), rate limits à gérer | ✅ |
 | Firehose / Jetstream (WebSocket) | Vrai temps réel, exhaustif | Consumer permanent (coût continu), filtrage à faire soi-même, plus complexe | ❌ surdimensionné pour un sujet de niche |
-| Firehose AT brut (CBOR) | Données complètes | Format binaire pénible | ❌ trop complexe |
 
 **Décision :** `searchPosts` interrogé toutes les 5-15 min par un job planifié. Le filtrage (termes climat + `lang=fr`) se fait côté serveur Bluesky, donc on ne rapatrie que le pertinent. Plus de WebSocket à maintenir.
 
@@ -160,14 +84,12 @@ Chaque brique répond à un « pourquoi celle-ci et pas une autre ».
 |---|---|---|---|
 | **Cloud Run Job + Cloud Scheduler (retenu)** | S'exécute, fait son travail, s'arrête (zéro coût au repos), conteneurisé, idéal pour du batch planifié | — | ✅ |
 | Cloud Run **service** (WebSocket permanent) | Nécessaire pour du streaming | Facturé en continu | ❌ plus de streaming |
-| Cloud Functions | Simple | Limites de durée/mémoire, moins souple | ⚠️ possible mais Jobs plus propre |
-| Dataflow | Puissant | Overkill et coûteux | ❌ |
 
 **Décision :** un **Cloud Run Job** pour les posts (déclenché toutes les 5-15 min par Cloud Scheduler) et un autre pour la météo (1×/jour). Un job s'exécute puis s'arrête : **pas de coût au repos**, ce qui remplace avantageusement l'ancien « interrupteur » manuel. C'est intrinsèquement économe.
 
 ### 4.3 Gestion des secrets : Secret Manager
 
-**Pourquoi Secret Manager et pas un `.env` ou des variables d'environnement en clair ?** Parce que les identifiants Bluesky (handle + app password) et la clé OpenWeatherMap sont des secrets. En clair dans le code ou la config, ils fuiteraient dans Git ou les logs. Secret Manager les stocke chiffrés, versionnés, avec accès contrôlé par IAM : chaque job lit ses secrets à l'exécution via son compte de service doté du rôle `roles/secretmanager.secretAccessor` (moindre privilège). C'est un standard de sécurité et un signal fort en entretien.
+Secret Manager stocke les identifiants API chiffrés, versionnés, avec accès contrôlé par IAM : chaque job lit ses secrets à l'exécution via son compte de service doté du rôle `roles/secretmanager.secretAccessor` (moindre privilège).
 
 ### 4.4 Couche bronze : Google Cloud Storage (lakehouse)
 
