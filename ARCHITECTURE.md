@@ -52,7 +52,7 @@ Démontrer la conception et l'implémentation d'un **pipeline de données end-to
 
 ### 3.1 Schéma de flux
 
-
+![Architecture](docs/images/schema_GCP_architecture.png)
 
 ### 3.2 Style architectural
 

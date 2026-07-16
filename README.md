@@ -13,13 +13,10 @@
 
 ## Démo
 
-*Captures du dashboard Looker Studio — à venir une fois l'ingestion consolidée.*
+*Captures du dashboard Looker Studio*
 
-<!-- Emplacements pour tes captures :
-![Vue d'ensemble](docs/images/dashboard-overview.png)
-![Corrélation météo × désinfo](docs/images/dashboard-correlation.png)
-![Top jours désinfo](docs/images/dashboard-top-days.png)
--->
+![Vue d'ensemble](docs/images/dashboard.png)
+
 
 *Le dashboard n'est volontairement pas hébergé publiquement (données publiques mais classification automatique, sans validation humaine — voir section « Résultats & limites »).*
 
