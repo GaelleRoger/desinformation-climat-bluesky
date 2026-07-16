@@ -167,7 +167,7 @@ printf "votre_cle_owm"             | gcloud secrets create owm-api-key --data-fi
 ## Contact
 
 **Gaëlle Roger** — Data Engineer / Data Architect
-[LinkedIn](https://www.linkedin.com/in/VOTRE_PROFIL) · [Email](mailto:VOTRE_EMAIL)
+[LinkedIn](https://www.linkedin.com/in/gaelle-roger) · [Email](mailto:gaelle.roger@ikmail.com)
 
 Les issues et pull requests sont les bienvenues pour toute suggestion d'amélioration architecturale ou méthodologique.
 
