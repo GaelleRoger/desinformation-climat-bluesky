@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(gcloud auth *)",
-      "Bash(curl -s -X POST https://dataform.googleapis.com/v1beta1/projects/climat-desinformation-bluesky/locations/europe-west1/repositories/climat-meteo/compilationResults/fdba1042-ffc4-406a-9b13-a3fcb1ee6a79:queryCompilationResultActions -H 'Authorization: Bearer __CMDSUB_OUTPUT__' -H 'Content-Type: application/json' -d '{}')"
-    ]
-  }
-}
