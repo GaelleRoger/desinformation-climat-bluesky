@@ -1,0 +1,7 @@
+config {
+  type: "declaration",
+  database: "climat-desinformation-bluesky",
+  schema: "silver",
+  name: "disinfo_labels",
+  description: "Classifications désinfo produites par load_results.py (Gemini Batch Prediction). Créée hors Dataform, déclarée ici pour le graphe de dépendances."
+}

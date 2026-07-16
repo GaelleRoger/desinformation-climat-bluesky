@@ -1,0 +1,7 @@
+config {
+  type: "declaration",
+  database: "climat-desinformation-bluesky",
+  schema: "bronze",
+  name: "posts_ext",
+  description: "Table externe BigQuery sur les fichiers JSONL bronze des posts Bluesky (créée par bq mk, cf. 3.1)."
+}

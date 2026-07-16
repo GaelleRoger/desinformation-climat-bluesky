@@ -1,0 +1,5 @@
+defaultProject: climat-desinformation-bluesky
+defaultLocation: europe-west1
+defaultDataset: dataform
+defaultAssertionDataset: dataform_assertions
+dataformCoreVersion: 3.0.52

@@ -1,0 +1,43 @@
+config {
+  type: "table",
+  schema: "silver",
+  description: "Posts climat FR nettoyés et dédoublonnés",
+  assertions: {
+    uniqueKey: ["post_id"],
+    nonNull: ["post_id", "created_at"]
+  }
+}
+
+WITH src AS (
+  SELECT
+    uri,
+    SPLIT(uri, "/")[SAFE_OFFSET(ARRAY_LENGTH(SPLIT(uri, "/")) - 1)] AS post_id,
+    auteur_handle,
+    texte,
+    date,
+    langues,
+    likes, 
+    reposts, 
+    reponses, 
+    ingested_at
+  FROM ${ref("posts_ext")}
+),
+
+deduped AS (
+  SELECT *,
+    ROW_NUMBER() OVER (PARTITION BY post_id ORDER BY ingested_at) AS rn
+  FROM src
+  WHERE uri IS NOT NULL AND "fr" IN UNNEST(langues)
+)
+
+SELECT
+  post_id, 
+  auteur_handle, 
+  texte,
+  TIMESTAMP(date) AS created_at,
+  DATE(TIMESTAMP(date)) AS event_date,
+  likes, 
+  reposts, 
+  reponses
+FROM deduped
+WHERE rn = 1

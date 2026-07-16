@@ -1,0 +1,13 @@
+config {
+  type: "table",
+  schema: "gold",
+  description: "Taux de désinformation climatique × météo Paris"
+}
+
+SELECT
+  d.event_date,
+  d.post_count, d.disinfo_count, d.pct_disinfo,
+  w.temp_max, w.temp_min
+FROM ${ref("daily_disinfo")} d
+LEFT JOIN ${ref("weather_daily")} w USING (event_date)
+ORDER BY d.event_date

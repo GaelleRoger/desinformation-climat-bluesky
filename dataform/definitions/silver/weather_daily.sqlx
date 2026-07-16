@@ -1,0 +1,33 @@
+config {
+    type: "table",
+    schema: "silver",
+    description: "Météo de Paris nettoyée",
+    assertions: {
+        uniqueKey: ["event_date"]
+    }
+}
+
+WITH
+  init AS (
+  SELECT
+    DATE(dt) AS event_date,
+    EXTRACT(HOUR
+    FROM
+      ingested_at) AS heure_utc,
+    payload.main.temp AS temp_mean
+  FROM
+    ${ref("weather_ext")} )
+SELECT
+  event_date,
+  MAX((CASE
+        WHEN heure_utc = 4 THEN temp_mean
+    END
+      )) AS temp_min,
+  MAX((CASE
+        WHEN heure_utc = 16 THEN temp_mean
+    END
+      )) AS temp_max
+FROM
+  init
+GROUP BY
+  1

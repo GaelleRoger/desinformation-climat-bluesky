@@ -1,0 +1,12 @@
+config { type: "table", schema: "gold" }
+
+SELECT
+  p.event_date,
+  COUNT(*) AS post_count,
+  COUNTIF(d.is_climate_disinfo) AS disinfo_count,
+  SAFE_DIVIDE(COUNTIF(d.is_climate_disinfo), COUNT(*)) AS pct_disinfo,
+  AVG(d.confidence) AS avg_confidence
+FROM ${ref("posts_clean")} p
+JOIN ${ref("disinfo_labels")} d USING (post_id)
+WHERE d.is_climate_related = TRUE     -- on exclut les faux positifs hors-sujet
+GROUP BY p.event_date
