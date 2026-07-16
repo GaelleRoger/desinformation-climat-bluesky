@@ -72,7 +72,7 @@ Un pipeline ELT industrialisé sur GCP qui ingère les posts Bluesky en françai
 
 Vue d'ensemble :
 
-![Architecture](docs/images/schema_GCP_architecture.png)
+![Architecture](docs/images/schema_GCP_Bluesky.png)
 
 Pour la conception détaillée (choix techniques justifiés, modèle de données) : [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
